@@ -40,6 +40,24 @@ fn env_bool(key: &str) -> Option<bool> {
     })
 }
 
+fn proxy_env_passthrough() -> Vec<String> {
+    // Preserve both uppercase and lowercase variants because different tools
+    // inside the cluster container may check different spellings.
+    [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "all_proxy",
+    ]
+    .iter()
+    .filter_map(|key| env_non_empty(key).map(|value| format!("{key}={value}")))
+    .collect()
+}
+
 /// Platform information for a Docker daemon host.
 #[derive(Debug, Clone)]
 pub struct HostPlatform {
@@ -621,6 +639,8 @@ pub async fn ensure_container(
         env_vars.push(format!("REGISTRY_PASSWORD={password}"));
     }
 
+    env_vars.extend(proxy_env_passthrough());
+
     if !extra_sans.is_empty() {
         env_vars.push(format!("EXTRA_SANS={}", extra_sans.join(",")));
     }
@@ -1193,6 +1213,68 @@ mod tests {
         assert!(
             sockets.len() <= 10,
             "should return a reasonable number of sockets"
+        );
+    }
+
+    #[test]
+    fn proxy_env_passthrough_includes_set_proxy_vars() {
+        let old_http = std::env::var("HTTP_PROXY").ok();
+        let old_https = std::env::var("HTTPS_PROXY").ok();
+
+        // SAFETY: test-only env mutation; restored before returning.
+        unsafe {
+            std::env::set_var("HTTP_PROXY", "http://proxy.internal:3128");
+            std::env::set_var("HTTPS_PROXY", "http://proxy.internal:3128");
+        }
+
+        let passthrough = proxy_env_passthrough();
+
+        // SAFETY: test-only env mutation; restore previous values.
+        unsafe {
+            match old_http {
+                Some(v) => std::env::set_var("HTTP_PROXY", v),
+                None => std::env::remove_var("HTTP_PROXY"),
+            }
+            match old_https {
+                Some(v) => std::env::set_var("HTTPS_PROXY", v),
+                None => std::env::remove_var("HTTPS_PROXY"),
+            }
+        }
+
+        assert!(
+            passthrough.iter().any(|v| v == "HTTP_PROXY=http://proxy.internal:3128"),
+            "HTTP_PROXY should be passed through"
+        );
+        assert!(
+            passthrough
+                .iter()
+                .any(|v| v == "HTTPS_PROXY=http://proxy.internal:3128"),
+            "HTTPS_PROXY should be passed through"
+        );
+    }
+
+    #[test]
+    fn proxy_env_passthrough_skips_empty_values() {
+        let old_no_proxy = std::env::var("NO_PROXY").ok();
+
+        // SAFETY: test-only env mutation; restored before returning.
+        unsafe {
+            std::env::set_var("NO_PROXY", "   ");
+        }
+
+        let passthrough = proxy_env_passthrough();
+
+        // SAFETY: test-only env mutation; restore previous values.
+        unsafe {
+            match old_no_proxy {
+                Some(v) => std::env::set_var("NO_PROXY", v),
+                None => std::env::remove_var("NO_PROXY"),
+            }
+        }
+
+        assert!(
+            !passthrough.iter().any(|v| v.starts_with("NO_PROXY=")),
+            "NO_PROXY should be omitted when empty/whitespace"
         );
     }
 }
