@@ -19,6 +19,7 @@ use crate::l7::middleware::{
 };
 use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
+use crate::l7::session::{HttpSession, RequestSlot};
 use crate::l7::{EndpointObserver, EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use miette::{IntoDiagnostic, Result, miette};
@@ -1232,20 +1233,30 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    // Keep read-ahead state for the lifetime of the inspected connection. An
-    // HTTP parser may fetch bytes from the next pipelined request while
-    // finishing the current one; retaining them here ensures the next request
-    // still passes through its own policy decision.
-    let mut client_buffer =
-        tokio::io::BufReader::with_capacity(CONNECTION_READ_AHEAD_BYTES, client);
+    let mut session = HttpSession::new(client);
+    relay_with_inspection_in_session(config, engine, &mut session, upstream, ctx).await
+}
+
+/// Borrow the original reader and slot from outside the cancellable exchange.
+pub(crate) async fn relay_with_inspection_in_session<C, U>(
+    config: &L7EndpointConfig,
+    engine: TunnelPolicyEngine,
+    session: &mut HttpSession<C>,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let mut upstream_buffer =
         tokio::io::BufReader::with_capacity(CONNECTION_READ_AHEAD_BYTES, upstream);
-    let client = &mut client_buffer;
+    let (client, slot) = session.parts();
     let upstream = &mut upstream_buffer;
 
     match config.protocol {
         L7Protocol::Rest | L7Protocol::Websocket => {
-            relay_rest(config, &engine, client, upstream, ctx).await
+            relay_rest(config, &engine, client, upstream, ctx, slot).await
         }
         L7Protocol::Graphql => relay_graphql(config, &engine, client, upstream, ctx).await,
         L7Protocol::Sql => {
@@ -1302,13 +1313,25 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    // Route selection also owns the full keep-alive loop, so buffered bytes
-    // remain available across per-request parsing and authorization.
-    let mut client_buffer =
-        tokio::io::BufReader::with_capacity(CONNECTION_READ_AHEAD_BYTES, client);
+    let mut session = HttpSession::new(client);
+    relay_with_route_selection_in_session(configs, engine, &mut session, upstream, ctx).await
+}
+
+/// Route-selected counterpart retaining the same outer-owned client capture.
+pub(crate) async fn relay_with_route_selection_in_session<C, U>(
+    configs: &[L7EndpointConfig],
+    engine: TunnelPolicyEngine,
+    session: &mut HttpSession<C>,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let mut upstream_buffer =
         tokio::io::BufReader::with_capacity(CONNECTION_READ_AHEAD_BYTES, upstream);
-    let client = &mut client_buffer;
+    let (client, slot) = session.parts();
     let upstream = &mut upstream_buffer;
 
     let provider =
@@ -1328,7 +1351,17 @@ where
             .endpoint_observation_tx
             .as_ref()
             .and_then(EndpointObservationSender::capture);
-        let mut req = match provider.parse_request(client).await {
+        let mut req = match provider
+            .capture_request_for_classification(
+                client,
+                slot,
+                engine.http_hitl_classification_enabled()
+                    && configs
+                        .iter()
+                        .any(|config| config.protocol == L7Protocol::Rest),
+            )
+            .await
+        {
             Ok(Some(req)) => req,
             Ok(None) => return Ok(()),
             Err(e) => {
@@ -1374,6 +1407,11 @@ where
                 .await?;
             return Ok(());
         };
+        if config.protocol != L7Protocol::Rest {
+            // A sibling REST route may have required a temporary snapshot
+            // before route selection. Non-REST processing never needs it.
+            slot.release_snapshot();
+        }
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
             config,
@@ -1540,7 +1578,14 @@ where
         let (allowed, reason) = if let Some(reason) = hard_deny_reason {
             (false, reason)
         } else {
-            crate::l7::hitl::evaluate_http_l7_request(&engine, ctx, config, &req, &request_info)?
+            crate::l7::hitl::evaluate_http_l7_request_with_slot(
+                &engine,
+                ctx,
+                config,
+                &req,
+                &request_info,
+                slot,
+            )?
         };
 
         if close_if_stale(engine.generation_guard(), ctx) {
@@ -1727,6 +1772,7 @@ where
             .await?;
             match outcome {
                 RelayOutcome::Reusable => {
+                    slot.complete_exchange()?;
                     if let Some(session) = middleware_session.take() {
                         session
                             .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
@@ -2191,9 +2237,10 @@ fn jsonrpc_engine_type(protocol: L7Protocol) -> &'static str {
 async fn relay_rest<C, U>(
     config: &L7EndpointConfig,
     engine: &TunnelPolicyEngine,
-    client: &mut C,
+    client: &mut tokio::io::BufReader<C>,
     upstream: &mut U,
     ctx: &L7EvalContext,
+    slot: &mut RequestSlot,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -2218,7 +2265,14 @@ where
             .filter(|_| ctx.token_grant_resolver.is_some())
             .and_then(EndpointObservationSender::capture);
         // Parse one HTTP request from client
-        let req = match provider.parse_request(client).await {
+        let req = match provider
+            .capture_request_for_classification(
+                client,
+                slot,
+                config.protocol == L7Protocol::Rest && engine.http_hitl_classification_enabled(),
+            )
+            .await
+        {
             Ok(Some(req)) => req,
             Ok(None) => return Ok(()), // Client closed connection
             Err(e) => {
@@ -2282,8 +2336,14 @@ where
         }
 
         // Evaluate L7 policy via Rego (using redacted target)
-        let (allowed, reason) =
-            crate::l7::hitl::evaluate_http_l7_request(engine, ctx, config, &req, &request_info)?;
+        let (allowed, reason) = crate::l7::hitl::evaluate_http_l7_request_with_slot(
+            engine,
+            ctx,
+            config,
+            &req,
+            &request_info,
+            slot,
+        )?;
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
@@ -2492,6 +2552,7 @@ where
             .await?;
             match outcome {
                 RelayOutcome::Reusable => {
+                    slot.complete_exchange()?;
                     if let Some(session) = middleware_session.take() {
                         session
                             .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
@@ -5110,9 +5171,10 @@ network_policies:
             relay_rest(
                 &config,
                 &tunnel_engine,
-                &mut relay_client,
+                &mut tokio::io::BufReader::new(&mut relay_client),
                 &mut relay_upstream,
                 &ctx,
+                &mut RequestSlot::new(),
             )
             .await
         });
@@ -7021,9 +7083,10 @@ network_policies:
             relay_rest(
                 &config,
                 &tunnel_engine,
-                &mut relay_client,
+                &mut tokio::io::BufReader::new(&mut relay_client),
                 &mut relay_upstream,
                 &ctx,
+                &mut RequestSlot::new(),
             )
             .await
         });
@@ -9758,9 +9821,10 @@ network_policies:
             relay_rest(
                 &config,
                 &tunnel_engine,
-                &mut relay_client,
+                &mut tokio::io::BufReader::new(&mut relay_client),
                 &mut relay_upstream,
                 &ctx,
+                &mut RequestSlot::new(),
             )
             .await
         });
