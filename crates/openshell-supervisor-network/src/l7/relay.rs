@@ -1355,7 +1355,7 @@ where
             .capture_request_for_classification(
                 client,
                 slot,
-                engine.http_hitl_classification_enabled()
+                engine.http_hitl_capture_enabled()
                     && configs
                         .iter()
                         .any(|config| config.protocol == L7Protocol::Rest),
@@ -1610,6 +1610,14 @@ where
             &reason,
             protocol_summary.as_deref(),
         );
+
+        if !allowed
+            && !force_deny
+            && config.enforcement == EnforcementMode::Enforce
+            && slot.try_begin_wait(&engine, &ctx.host, ctx.port)
+        {
+            return Ok(());
+        }
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
@@ -2269,7 +2277,7 @@ where
             .capture_request_for_classification(
                 client,
                 slot,
-                config.protocol == L7Protocol::Rest && engine.http_hitl_classification_enabled(),
+                config.protocol == L7Protocol::Rest && engine.http_hitl_capture_enabled(),
             )
             .await
         {
@@ -2402,6 +2410,13 @@ where
                 ))
                 .build();
             ocsf_emit!(event);
+        }
+
+        if !allowed
+            && config.enforcement == EnforcementMode::Enforce
+            && slot.try_begin_wait(engine, &ctx.host, ctx.port)
+        {
+            return Ok(());
         }
 
         if allowed || config.enforcement == EnforcementMode::Audit {
