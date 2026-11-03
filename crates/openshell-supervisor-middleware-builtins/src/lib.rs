@@ -3,6 +3,7 @@
 
 //! First-party in-process supervisor middleware implementations.
 
+pub mod mandatory_auth;
 mod regex;
 
 use std::sync::Arc;
