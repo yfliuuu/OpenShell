@@ -84,6 +84,94 @@ pub struct ProviderCredentialState {
     inner: Arc<RwLock<ProviderCredentialStateInner>>,
 }
 
+/// Request-owned identity of one atomically resolved static credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialProvenance {
+    revision: u64,
+    installation_id: String,
+    expires_at_ms: Option<i64>,
+    env_key: String,
+    credential_identity: String,
+}
+
+impl CredentialProvenance {
+    /// Reject replaced, revoked, or expired material before upstream dispatch.
+    pub fn ensure_current(
+        &self,
+        state: &ProviderCredentialState,
+    ) -> Result<(), StaticCredentialBindingError> {
+        let inner = state
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        if inner.current.revision != self.revision
+            || inner.current.installation_id != self.installation_id
+            || inner
+                .static_credential_bindings
+                .get(&self.env_key)
+                .is_none_or(|binding| binding.credential_identity != self.credential_identity)
+        {
+            return Err(binding_error(
+                "static credential installation changed before dispatch",
+            ));
+        }
+        if self
+            .expires_at_ms
+            .is_some_and(|expiry| expiry <= crate::time::now_ms())
+        {
+            return Err(binding_error("static credential expired before dispatch"));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub fn installation_id(&self) -> &str {
+        &self.installation_id
+    }
+
+    #[must_use]
+    pub fn expires_at_ms(&self) -> Option<i64> {
+        self.expires_at_ms
+    }
+
+    #[must_use]
+    pub fn credential_identity(&self) -> &str {
+        &self.credential_identity
+    }
+}
+
+/// A current credential and its provenance; Debug never exposes the value.
+pub struct ResolvedStaticCredential {
+    value: String,
+    provenance: CredentialProvenance,
+}
+
+impl fmt::Debug for ResolvedStaticCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedStaticCredential")
+            .field("provenance", &self.provenance)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResolvedStaticCredential {
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    #[must_use]
+    pub fn provenance(&self) -> &CredentialProvenance {
+        &self.provenance
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticCredentialBindingError {
     message: String,
@@ -309,6 +397,60 @@ impl ProviderCredentialState {
             .expect("provider credential state poisoned")
             .combined_resolver
             .clone()
+    }
+
+    /// Capture a declared current credential and its dispatch pin under one lock.
+    ///
+    /// Unlike placeholder resolution, this never selects retained generations
+    /// or unclassified environment values.
+    pub fn resolve_static_credential(
+        &self,
+        key: &str,
+        host: &str,
+        port: u16,
+        path: &str,
+    ) -> Result<ResolvedStaticCredential, StaticCredentialBindingError> {
+        let path = path.split_once('?').map_or(path, |(path, _)| path);
+        let path = crate::secrets::redact_target_for_policy(path)
+            .map_err(|_| binding_error("static credential endpoint is unavailable"))?;
+        let host = host.to_ascii_lowercase();
+        let labels = host.split('.').collect::<Vec<_>>();
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        let binding = inner
+            .static_credential_bindings
+            .get(key)
+            .ok_or_else(|| binding_error("static credential binding is unavailable"))?;
+        if !binding
+            .endpoints
+            .iter()
+            .any(|endpoint| static_credential_endpoint_matches(endpoint, &labels, port, &path))
+        {
+            return Err(binding_error("static credential endpoint is unauthorized"));
+        }
+        let resolver = inner
+            .current_resolver
+            .as_ref()
+            .ok_or_else(|| binding_error("static credential is unavailable"))?;
+        let value = resolver
+            .resolve_current_env_key_checked(key, "mandatory_auth")
+            .map_err(|_| binding_error("static credential is unavailable"))?
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| binding_error("static credential is unavailable"))?;
+        Ok(ResolvedStaticCredential {
+            value: value.to_owned(),
+            provenance: CredentialProvenance {
+                revision: inner.current.revision,
+                installation_id: inner.current.installation_id.clone(),
+                expires_at_ms: resolver
+                    .expires_at_ms_for_placeholder(&crate::secrets::placeholder_for_env_key(key))
+                    .filter(|expiry| *expiry > 0),
+                env_key: key.to_owned(),
+                credential_identity: binding.credential_identity.clone(),
+            },
+        })
     }
 
     /// Resolve provider placeholders only for credentials bound to this
@@ -1363,6 +1505,117 @@ mod tests {
         binding.credential_identity = format!("refresh:{handle}");
         binding.workload_credential_handle = handle.to_string();
         binding
+    }
+
+    #[test]
+    fn atomic_static_capture_authorizes_endpoint_and_redacts_debug() {
+        let expiry = crate::time::now_ms() + 60_000;
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            HashMap::from([
+                ("API_KEY".into(), "synthetic-token".into()),
+                ("PROJECT".into(), "non-secret".into()),
+            ]),
+            HashMap::from([("API_KEY".into(), expiry)]),
+            HashMap::new(),
+            HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/v1/**"))]),
+            vec!["PROJECT".into()],
+        )
+        .unwrap();
+        let captured = state
+            .resolve_static_credential("API_KEY", "API.EXAMPLE.COM", 443, "/v1/items?limit=1")
+            .unwrap();
+        assert_eq!(captured.value(), "synthetic-token");
+        assert_eq!(captured.provenance().revision(), 7);
+        assert_eq!(captured.provenance().expires_at_ms(), Some(expiry));
+        assert_eq!(
+            captured.provenance().credential_identity(),
+            "provider-a:API_KEY"
+        );
+        assert_eq!(
+            captured.provenance().installation_id(),
+            state.snapshot().installation_id
+        );
+        captured.provenance().ensure_current(&state).unwrap();
+        assert!(!format!("{captured:?}").contains("synthetic-token"));
+        for (key, host, port, path) in [
+            ("API_KEY", "other.example.com", 443, "/v1/items"),
+            ("API_KEY", "api.example.com", 80, "/v1/items"),
+            ("API_KEY", "api.example.com", 443, "/other"),
+            ("PROJECT", "api.example.com", 443, "/v1/items"),
+            ("MISSING", "api.example.com", 443, "/v1/items"),
+        ] {
+            assert!(
+                state
+                    .resolve_static_credential(key, host, port, path)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_static_capture_rejects_reconstruction_revocation_and_expiry() {
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            HashMap::from([("API_KEY".into(), "old-token".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+            Vec::new(),
+        )
+        .unwrap();
+        let captured = state
+            .resolve_static_credential("API_KEY", "api.example.com", 443, "/")
+            .unwrap();
+        let mut expired = captured.provenance().clone();
+        expired.expires_at_ms = Some(crate::time::now_ms() - 1);
+        assert!(expired.ensure_current(&state).is_err());
+        state
+            .install_bound_environment(
+                7,
+                HashMap::from([("API_KEY".into(), "new-token".into())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(captured.provenance().ensure_current(&state).is_err());
+        let current = state
+            .resolve_static_credential("API_KEY", "api.example.com", 443, "/")
+            .unwrap();
+        assert_eq!(current.value(), "new-token");
+        assert_ne!(
+            captured.provenance().installation_id(),
+            current.provenance().installation_id()
+        );
+        state.revoke_static_provider_environment(7);
+        assert!(current.provenance().ensure_current(&state).is_err());
+        assert!(
+            state
+                .resolve_static_credential("API_KEY", "api.example.com", 443, "/")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn atomic_static_capture_rejects_empty_expired_and_unsafe_values() {
+        for (value, expiry) in [("", 0), ("token", 1), ("bad\r\nvalue", 0)] {
+            let state = ProviderCredentialState::from_bound_environment(
+                7,
+                HashMap::from([("API_KEY".into(), value.into())]),
+                HashMap::from([("API_KEY".into(), expiry)]),
+                HashMap::new(),
+                HashMap::from([("API_KEY".into(), binding("api.example.com", 443, "/**"))]),
+                Vec::new(),
+            )
+            .unwrap();
+            assert!(
+                state
+                    .resolve_static_credential("API_KEY", "api.example.com", 443, "/")
+                    .is_err()
+            );
+        }
     }
 
     fn assert_binding_validation_error(
