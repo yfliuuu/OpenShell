@@ -862,6 +862,15 @@ impl<'a> CredentialGenerationGuard<'a> {
 
     pub(crate) fn ensure_current(self) -> Result<()> {
         for pin in self.middleware_provenance {
+            if pin.revision() != self.revision
+                || self
+                    .installation_id
+                    .is_some_and(|id| id != pin.installation_id())
+            {
+                return Err(miette::Report::new(CredentialUnavailableError::new(
+                    "middleware and later credential preparation used different installations",
+                )));
+            }
             pin.ensure_current(self.state).map_err(|_| {
                 miette::Report::new(CredentialUnavailableError::new(
                     "middleware credential is stale, revoked, or expired",

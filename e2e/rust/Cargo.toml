@@ -25,6 +25,8 @@ e2e = []
 # `e2e-kubernetes` does NOT imply this and the Helm wrapper opts in explicitly
 # when it has resolved an IP.
 e2e-host-gateway = ["e2e"]
+# Requires gateway and supervisor artifacts built with mandatory-static-auth.
+e2e-mandatory-static-auth = ["e2e-host-gateway"]
 e2e-local-container-driver = ["e2e"]
 e2e-docker = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 # Selects tests that need a Docker gateway with config_delivery_mode = "push".

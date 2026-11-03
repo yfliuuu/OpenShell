@@ -177,6 +177,31 @@ A denial from middleware always blocks traffic, regardless of `on_error`. Middle
 
 `on_error` does not extend what middleware can inspect. The [current limitations](/extensibility/supervisor-middleware#current-limitations) apply under both settings. With the default behavior, an entry cannot select a `tls: skip` endpoint, because OpenShell cannot inspect that traffic.
 
+## Mandatory Static Authentication in Custom Builds
+
+Custom gateway and supervisor binaries built with the `mandatory-static-auth` feature provide `acme/myservice-auth` as in-process middleware. Default builds do not register it. It requires gateway-managed sandbox configuration and no external middleware service.
+
+Attach a provider with a declared static credential key and endpoint binding, then add an independent mandatory attachment:
+
+```yaml showLineNumbers={false}
+network_middlewares:
+  mandatory_myservice_auth:
+    middleware: acme/myservice-auth
+    order: 2147483647
+    on_error: fail_closed
+    endpoints:
+      include: [api.myservice.example]
+    config:
+      credential_env: MYSERVICE_TOKEN
+      header_name: X-MyService-ID
+```
+
+The handler supports only `X-MyService-ID` and replaces every existing value with the sandbox's current credential. The maximum order makes it the last request middleware. Dynamic token grants targeting the same header on overlapping hosts are incompatible and prevent supervisor activation.
+
+Keep the attachment outside provider-generated policy so detaching a provider cannot remove enforcement. After detachment or revocation activates, protected requests fail closed until an authorized replacement becomes available. Rotation applies to subsequent requests on existing connections. Requests prepared with a replaced installation or an expired credential cannot dispatch.
+
+The request body limit is 256 KiB. Existing buffering and inspected HTTP protocol limitations still apply. The service must treat this header as authoritative and must not expose the credential in responses. Refer to the [custom-build implementation and verification guide](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-supervisor-middleware-builtins/README.md) for build instructions.
+
 ## Operate Middleware Services
 
 Middleware services sit on the request path of every sandbox that uses them. Plan their availability accordingly:
