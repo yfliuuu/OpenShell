@@ -187,14 +187,16 @@ A denial from middleware always blocks traffic, regardless of `on_error`. Middle
 
 ## Mandatory Static Authentication
 
-Default gateway and supervisor builds enable the `mandatory-static-auth` Cargo feature and register `acme/myservice-auth` as in-process middleware. Enforcement remains opt-in through sandbox policy. It requires gateway-managed sandbox configuration and no external middleware service. Builds using `--no-default-features` must select `mandatory-static-auth` if they need this handler; the telemetry-free and supervisor system-CA build aliases retain it.
+Default gateway and supervisor builds enable the `mandatory-static-auth` Cargo feature and register `agent-guardrails/mandatory-auth` as in-process middleware. Enforcement remains opt-in through sandbox policy. It requires gateway-managed sandbox configuration and no external middleware service. Builds using `--no-default-features` must select `mandatory-static-auth` if they need this handler; the telemetry-free and supervisor system-CA build aliases retain it.
+
+When upgrading from earlier development builds, update the attachment's `middleware` field to `agent-guardrails/mandatory-auth`. The previous development identifier is no longer registered.
 
 Attach providers with distinct static credential keys and endpoint bindings, then add one independent mandatory attachment:
 
 ```yaml showLineNumbers={false}
 network_middlewares:
   mandatory_myservice_auth:
-    middleware: acme/myservice-auth
+    middleware: agent-guardrails/mandatory-auth
     order: 2147483647
     on_error: fail_closed
     endpoints:

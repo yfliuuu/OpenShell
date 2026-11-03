@@ -20,7 +20,7 @@ use openshell_core::proto::{
 use openshell_core::provider_credentials::ProviderCredentialState;
 use serde::Deserialize;
 
-pub const NAME: &str = "acme/myservice-auth";
+pub const NAME: &str = "agent-guardrails/mandatory-auth";
 const MAX_RULES: usize = 64;
 
 #[derive(Deserialize)]
