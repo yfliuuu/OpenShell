@@ -5,18 +5,24 @@ services through `services_for_sandbox`, using the immutable sandbox ID and a
 clone of the live `ProviderCredentialState` handle. Registry reconstruction must
 reuse that handle, not a startup credential snapshot.
 
-## Opt-in mandatory static authentication
+## Mandatory static authentication
 
-Build both binaries with the `mandatory-static-auth` feature:
+The gateway and supervisor enable the `mandatory-static-auth` Cargo feature by
+default:
 
 ```shell
-cargo build -p openshell-gateway -p openshell-supervisor --features mandatory-static-auth
+cargo build -p openshell-gateway -p openshell-supervisor
 ```
 
-Deploy these binaries in your custom gateway and supervisor runtime artifacts.
-The feature is off by default. It registers `acme/myservice-auth` in-process;
-do not add an external gRPC middleware registration. It requires gateway-managed
-sandbox configuration, not standalone proxy or local policy-file mode.
+Deploy matching gateway and supervisor runtime artifacts. They register
+`acme/myservice-auth` in-process; do not add an external gRPC middleware
+registration. Compilation makes the handler available, but only a sandbox
+policy attachment activates enforcement. It requires gateway-managed sandbox
+configuration, not standalone proxy or local policy-file mode.
+
+Builds using `--no-default-features` must select `mandatory-static-auth` when
+they need the handler. The `defaults-without-telemetry` aliases and the
+supervisor's `system-ca-roots` alias retain it.
 
 Attach providers declaring distinct static credential environment keys and
 endpoint bindings, then configure one mandatory attachment independently of the
@@ -125,7 +131,7 @@ cargo test -p openshell-supervisor-middleware --lib headers::tests
 cargo test -p openshell-supervisor-middleware-builtins --lib --features mandatory-static-auth mandatory_auth
 cargo test -p openshell-supervisor-network --lib mandatory_auth
 cargo test -p openshell-supervisor-network --lib middleware_provenance
-cargo test -p openshell-supervisor --lib --features mandatory-static-auth mandatory_auth
+cargo test -p openshell-supervisor --lib mandatory_auth
 cargo test -p openshell-server --lib --features mandatory-static-auth middleware::tests
 ```
 
@@ -136,7 +142,7 @@ with two providers and different custom headers, verifying that selective
 revocation leaves the other endpoint usable. Dispatch tests cover expiry and
 installation changes before upstream writes.
 
-Against a dedicated E2E gateway and supervisor built with the feature, use:
+Against a dedicated E2E gateway and supervisor with the handler available, use:
 
 ```shell
 cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker,e2e-mandatory-static-auth --test proxy_egress_pipeline mandatory_static_auth_overwrites_workload_credentials
