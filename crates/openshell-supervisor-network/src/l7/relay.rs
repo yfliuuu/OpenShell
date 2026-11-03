@@ -75,6 +75,9 @@ pub struct L7EvalContext {
     /// Repairs may retain the revision, so keep this identity across the grant
     /// await and the final static-credential scoping before the upstream write.
     pub(crate) provider_credential_installation_id: Option<String>,
+    /// Originating pins from this request's local authentication middleware.
+    pub(crate) middleware_credential_provenance:
+        Vec<openshell_core::provider_credentials::CredentialProvenance>,
     pub(crate) body_classifier: Option<Arc<secrets::body::BodyCredentialClassifier>>,
     /// Anonymous activity counter channel.
     pub(crate) activity_tx: Option<ActivitySender>,
@@ -88,6 +91,22 @@ pub struct L7EvalContext {
 }
 
 impl L7EvalContext {
+    pub(crate) fn ensure_middleware_credentials_current(&self) -> Result<()> {
+        if self.middleware_credential_provenance.is_empty() {
+            return Ok(());
+        }
+        let unavailable = || {
+            miette::Report::new(crate::l7::rest::CredentialUnavailableError::new(
+                "middleware credential is stale, unavailable, or expired",
+            ))
+        };
+        let state = self.provider_credentials.as_ref().ok_or_else(unavailable)?;
+        for pin in &self.middleware_credential_provenance {
+            pin.ensure_current(state).map_err(|_| unavailable())?;
+        }
+        Ok(())
+    }
+
     /// Whether the inspected transport is plaintext rather than TLS-terminated.
     fn is_plaintext(&self) -> bool {
         self.request_default_port == Some(80)
@@ -152,7 +171,8 @@ fn credential_generation_guard(
             ctx.provider_credentials.as_ref()?,
             ctx.provider_credential_revision?,
         )
-        .with_installation_id(ctx.provider_credential_installation_id.as_deref()),
+        .with_installation_id(ctx.provider_credential_installation_id.as_deref())
+        .with_middleware_provenance(&ctx.middleware_credential_provenance),
     )
 }
 
@@ -172,6 +192,7 @@ pub(crate) async fn prepare_inspected_request(
     observation_context: Option<&openshell_core::endpoint_status::EndpointObservationContext>,
 ) -> Result<(crate::l7::provider::L7Request, L7EvalContext)> {
     let mut scoped = ctx.clone();
+    scoped.ensure_middleware_credentials_current()?;
     let snapshot = crate::l7::token_grant_injection::pin_live_credentials(&mut scoped);
     // Admission-gated injection reads credentials only from the pinned snapshot,
     // so a context without one never acquires a grant.
@@ -1444,8 +1465,8 @@ where
                 &request_id,
             )
             .await;
-            let req = match middleware_result? {
-                MiddlewareApplyResult::Allowed(request) => request,
+            let (req, credential_provenance) = match middleware_result? {
+                MiddlewareApplyResult::Allowed(request, provenance) => (request, provenance),
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     if let Some(observer) = observer.as_ref() {
                         observer.observe(EndpointResult::PolicyDenied);
@@ -1520,6 +1541,7 @@ where
             };
             let query_params = req.query_params.clone();
             let mut forwarding_ctx = ctx.clone();
+            forwarding_ctx.middleware_credential_provenance = credential_provenance;
             let outcome_result = forward_inspected_request(
                 req,
                 client,
@@ -2191,8 +2213,8 @@ where
                 &request_id,
             )
             .await;
-            let req = match middleware_result? {
-                MiddlewareApplyResult::Allowed(request) => request,
+            let (req, credential_provenance) = match middleware_result? {
+                MiddlewareApplyResult::Allowed(request, provenance) => (request, provenance),
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
@@ -2264,6 +2286,7 @@ where
             };
             let query_params = req.query_params.clone();
             let mut forwarding_ctx = ctx.clone();
+            forwarding_ctx.middleware_credential_provenance = credential_provenance;
             let outcome_result = forward_inspected_request(
                 req,
                 client,
@@ -2609,7 +2632,7 @@ where
             // stage so a middleware cannot smuggle a denied operation to the
             // upstream or the next stage.
             let validate = transformed_body_validator(config, engine, ctx, &request_info);
-            let req = match apply_middleware_chain_with_request_id(
+            let (req, credential_provenance) = match apply_middleware_chain_with_request_id(
                 req,
                 client,
                 ctx,
@@ -2621,7 +2644,7 @@ where
             )
             .await?
             {
-                MiddlewareApplyResult::Allowed(request) => request,
+                MiddlewareApplyResult::Allowed(request, provenance) => (request, provenance),
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     if let Some(observer) = observer.as_ref() {
                         observer.observe(EndpointResult::PolicyDenied);
@@ -2662,6 +2685,7 @@ where
                 }
             };
             let mut forwarding_ctx = ctx.clone();
+            forwarding_ctx.middleware_credential_provenance = credential_provenance;
             let Some(outcome) = forward_inspected_request(
                 req,
                 client,
@@ -2891,7 +2915,7 @@ where
             // stage so a middleware cannot smuggle a denied operation to the
             // upstream or the next stage.
             let validate = transformed_body_validator(config, engine, ctx, &request_info);
-            let req = match apply_middleware_chain_with_request_id(
+            let (req, credential_provenance) = match apply_middleware_chain_with_request_id(
                 req,
                 client,
                 ctx,
@@ -2903,7 +2927,7 @@ where
             )
             .await?
             {
-                MiddlewareApplyResult::Allowed(request) => request,
+                MiddlewareApplyResult::Allowed(request, provenance) => (request, provenance),
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
@@ -2941,6 +2965,7 @@ where
                 }
             };
             let mut forwarding_ctx = ctx.clone();
+            forwarding_ctx.middleware_credential_provenance = credential_provenance;
             let Some(outcome) = forward_inspected_request(
                 req,
                 client,
@@ -3520,8 +3545,8 @@ where
     // `allow_encoded_slash` opt-in applies.
     let provider = crate::l7::rest::RestProvider::default();
     let mut request_count: u64 = 0;
-    let mut grant_ctx = ctx.clone();
     loop {
+        let mut grant_ctx = ctx.clone();
         if close_if_stale(generation_guard, ctx) {
             return Ok(());
         }
@@ -3613,7 +3638,10 @@ where
                 )
                 .await?;
             let request = match result {
-                MiddlewareApplyResult::Allowed(request) => request,
+                MiddlewareApplyResult::Allowed(request, provenance) => {
+                    grant_ctx.middleware_credential_provenance = provenance;
+                    request
+                }
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: "HTTP".into(),
@@ -3656,6 +3684,7 @@ where
             req
         };
 
+        grant_ctx.ensure_middleware_credentials_current()?;
         let injected = match crate::l7::token_grant_injection::pin_live_credentials(&mut grant_ctx)
         {
             Some(snapshot) => {
@@ -6569,7 +6598,7 @@ network_policies:
         // -> stream through unprocessed.
         assert!(matches!(
             resolve_unbuffered_body(&ctx, req(), &open_chain, true),
-            MiddlewareApplyResult::Allowed(_)
+            MiddlewareApplyResult::Allowed(..)
         ));
         // Any fail-closed entry -> deny.
         assert!(matches!(
@@ -7392,7 +7421,7 @@ network_policies:
         .expect("apply middleware chain");
 
         match result {
-            MiddlewareApplyResult::Allowed(rebuilt) => {
+            MiddlewareApplyResult::Allowed(rebuilt, _) => {
                 let raw = String::from_utf8(rebuilt.raw_header).expect("utf8 request");
                 assert!(
                     raw.ends_with("[SCRUBBED BY TEST REDACTOR]"),
@@ -7506,7 +7535,7 @@ network_policies:
             )
             .await
             .expect("apply middleware chain");
-            assert!(matches!(result, MiddlewareApplyResult::Allowed(_)));
+            assert!(matches!(result, MiddlewareApplyResult::Allowed(..)));
             assert_eq!(seen.lock().unwrap().pop().as_deref(), Some(scheme));
         }
     }

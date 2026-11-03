@@ -14,7 +14,10 @@ use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub enum MiddlewareApplyResult {
-    Allowed(crate::l7::provider::L7Request),
+    Allowed(
+        crate::l7::provider::L7Request,
+        Vec<openshell_core::provider_credentials::CredentialProvenance>,
+    ),
     Denied {
         denial: Option<openshell_supervisor_middleware::MiddlewareDenial>,
     },
@@ -545,7 +548,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     request_id: &str,
 ) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
-        return Ok(MiddlewareApplyResult::Allowed(req));
+        return Ok(MiddlewareApplyResult::Allowed(req, Vec::new()));
     }
     let chain = runner.describe_chain(&chain).await?;
     let admission = if chain.is_empty() {
@@ -588,7 +591,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
             .await?;
         emit_middleware_events(ctx, &req, &outcome);
         return Ok(if outcome.allowed {
-            MiddlewareApplyResult::Allowed(req)
+            MiddlewareApplyResult::Allowed(req, outcome.credential_provenance)
         } else {
             MiddlewareApplyResult::Denied {
                 denial: outcome.denial,
@@ -648,7 +651,10 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
         &outcome.body,
         &outcome.header_mutations,
     )?;
-    Ok(MiddlewareApplyResult::Allowed(rebuilt))
+    Ok(MiddlewareApplyResult::Allowed(
+        rebuilt,
+        outcome.credential_provenance,
+    ))
 }
 
 pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpin + Send>(
@@ -783,7 +789,7 @@ pub(super) fn resolve_unbuffered_body(
         .all(|entry| entry.on_error() == openshell_supervisor_middleware::OnError::FailOpen);
     if recoverable && all_fail_open {
         emit_middleware_body_unavailable(ctx, false);
-        return MiddlewareApplyResult::Allowed(req);
+        return MiddlewareApplyResult::Allowed(req, Vec::new());
     }
     emit_middleware_body_unavailable(ctx, true);
     MiddlewareApplyResult::Denied { denial: None }

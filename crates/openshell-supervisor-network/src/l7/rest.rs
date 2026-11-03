@@ -803,6 +803,7 @@ pub(crate) struct CredentialGenerationGuard<'a> {
     state: &'a openshell_core::provider_credentials::ProviderCredentialState,
     revision: u64,
     installation_id: Option<&'a str>,
+    middleware_provenance: &'a [openshell_core::provider_credentials::CredentialProvenance],
 }
 
 /// Typed marker for provider credential material that cannot be used.
@@ -815,7 +816,7 @@ pub(crate) struct CredentialUnavailableError {
 }
 
 impl CredentialUnavailableError {
-    fn new(reason: &'static str) -> Self {
+    pub(crate) fn new(reason: &'static str) -> Self {
         Self { reason }
     }
 }
@@ -839,6 +840,7 @@ impl<'a> CredentialGenerationGuard<'a> {
             state,
             revision,
             installation_id: None,
+            middleware_provenance: &[],
         }
     }
 
@@ -850,7 +852,22 @@ impl<'a> CredentialGenerationGuard<'a> {
         self
     }
 
+    pub(crate) fn with_middleware_provenance(
+        mut self,
+        provenance: &'a [openshell_core::provider_credentials::CredentialProvenance],
+    ) -> Self {
+        self.middleware_provenance = provenance;
+        self
+    }
+
     pub(crate) fn ensure_current(self) -> Result<()> {
+        for pin in self.middleware_provenance {
+            pin.ensure_current(self.state).map_err(|_| {
+                miette::Report::new(CredentialUnavailableError::new(
+                    "middleware credential is stale, revoked, or expired",
+                ))
+            })?;
+        }
         let snapshot = self.state.snapshot();
         if snapshot.revision == self.revision
             && self
@@ -9981,6 +9998,92 @@ mod tests {
                 .is_err()
         );
         assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn middleware_provenance_rejects_stale_material_before_upstream_bytes() {
+        use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+        use openshell_core::provider_credentials::ProviderCredentialState;
+        for transition in ["rotation", "reconstruction", "expiry"] {
+            let expiry = if transition == "expiry" {
+                openshell_core::time::now_ms() + 100
+            } else {
+                0
+            };
+            let bindings = HashMap::from([(
+                "API_KEY".into(),
+                StaticCredentialBinding {
+                    credential_identity: "provider:API_KEY".into(),
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.com".into(),
+                        port: 443,
+                        path: "/**".into(),
+                    }],
+                    ..Default::default()
+                },
+            )]);
+            let state = ProviderCredentialState::from_bound_environment(
+                7,
+                HashMap::from([("API_KEY".into(), "old-token".into())]),
+                HashMap::from([("API_KEY".into(), expiry)]),
+                HashMap::new(),
+                bindings.clone(),
+                Vec::new(),
+            )
+            .unwrap();
+            let captured = state
+                .resolve_static_credential("API_KEY", "api.example.com", 443, "/")
+                .unwrap();
+            let pins = vec![captured.provenance().clone()];
+            if transition == "expiry" {
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            } else {
+                state
+                    .install_bound_environment(
+                        if transition == "rotation" { 8 } else { 7 },
+                        HashMap::from([("API_KEY".into(), "new-token".into())]),
+                        HashMap::new(),
+                        HashMap::new(),
+                        bindings,
+                        Vec::new(),
+                    )
+                    .unwrap();
+            }
+            // Even a later preparation step observing the newest revision must
+            // not reauthorize the literal token captured by middleware.
+            let guard = CredentialGenerationGuard::new(&state, state.revision())
+                .with_middleware_provenance(&pins);
+            let request = L7Request {
+                action: "GET".into(),
+                target: "/".into(),
+                query_params: HashMap::new(),
+                raw_header:
+                    b"GET / HTTP/1.1\r\nHost: api.example.com\r\nX-MyService-ID: old-token\r\n\r\n"
+                        .to_vec(),
+                body_length: BodyLength::None,
+            };
+            let (mut client, _client_peer) = tokio::io::duplex(1024);
+            let (mut upstream, mut upstream_peer) = tokio::io::duplex(1024);
+            let error = relay_http_request_with_options_guarded(
+                &request,
+                &mut client,
+                &mut upstream,
+                RelayRequestOptions {
+                    credential_generation: Some(guard),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(error.downcast_ref::<CredentialUnavailableError>().is_some());
+            drop(upstream);
+            let mut observed = Vec::new();
+            upstream_peer.read_to_end(&mut observed).await.unwrap();
+            assert!(
+                observed.is_empty(),
+                "{transition} must not dispatch stale material"
+            );
+        }
     }
 
     #[test]
