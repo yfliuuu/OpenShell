@@ -65,7 +65,7 @@ async fn exercise_live_authentication(initial: &str, inspected: bool) {
 version: 1
 network_middlewares:
   mandatory:
-    middleware: acme/myservice-auth
+    middleware: agent-guardrails/mandatory-auth
     order: 2147483647
     on_error: fail_closed
     endpoints:
@@ -320,7 +320,7 @@ async fn mandatory_auth_endpoint_rules_isolate_two_providers_on_live_connections
 version: 1
 network_middlewares:
   mandatory:
-    middleware: acme/myservice-auth
+    middleware: agent-guardrails/mandatory-auth
     order: 2147483647
     on_error: fail_closed
     endpoints:

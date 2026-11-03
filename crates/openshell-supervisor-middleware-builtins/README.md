@@ -15,7 +15,7 @@ cargo build -p openshell-gateway -p openshell-supervisor
 ```
 
 Deploy matching gateway and supervisor runtime artifacts. They register
-`acme/myservice-auth` in-process; do not add an external gRPC middleware
+`agent-guardrails/mandatory-auth` in-process; do not add an external gRPC middleware
 registration. Compilation makes the handler available, but only a sandbox
 policy attachment activates enforcement. It requires gateway-managed sandbox
 configuration, not standalone proxy or local policy-file mode.
@@ -31,7 +31,7 @@ providers' generated policies:
 ```yaml
 network_middlewares:
   mandatory_myservice_auth:
-    middleware: acme/myservice-auth
+    middleware: agent-guardrails/mandatory-auth
     order: 2147483647
     on_error: fail_closed
     endpoints:

@@ -42,7 +42,7 @@ mod tests {
 version: 1
 network_middlewares:
   mandatory:
-    middleware: acme/myservice-auth
+    middleware: agent-guardrails/mandatory-auth
     order: 2147483647
     on_error: fail_closed
     endpoints:
@@ -85,7 +85,7 @@ network_middlewares:
 version: 1
 network_middlewares:
   mandatory:
-    middleware: acme/myservice-auth
+    middleware: agent-guardrails/mandatory-auth
     order: 2147483647
     on_error: fail_closed
     endpoints:

@@ -1702,7 +1702,7 @@ async fn mandatory_static_auth_overwrites_workload_credentials() {
         let middleware = format!(
             r"network_middlewares:
   mandatory:
-    middleware: acme/myservice-auth
+    middleware: agent-guardrails/mandatory-auth
     order: 2147483647
     on_error: fail_closed
     endpoints:

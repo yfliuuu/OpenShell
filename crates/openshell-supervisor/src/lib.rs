@@ -4640,7 +4640,7 @@ filesystem_policy:
 version: 1
 network_middlewares:
   mandatory:
-    middleware: acme/myservice-auth
+    middleware: agent-guardrails/mandatory-auth
     order: 2147483647
     on_error: fail_closed
     endpoints:
