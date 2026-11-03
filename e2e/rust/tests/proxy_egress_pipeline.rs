@@ -42,7 +42,7 @@ const PRIVATE_ALLOWED_IPS: &str = r#"        allowed_ips:
           - "172.0.0.0/8"
           - "192.168.0.0/16"
           - "fc00::/7""#;
-static PROVIDER_LOCK: Mutex<()> = Mutex::new(());
+static PROVIDER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn run_cli(args: &[&str]) -> Result<String, String> {
     let mut cmd = openshell_cmd();
@@ -738,10 +738,17 @@ async fn handle_credential_probe(mut stream: TcpStream) -> io::Result<()> {
     let saw_placeholder = request
         .windows(PLACEHOLDER_PREFIX.len())
         .any(|window| window == PLACEHOLDER_PREFIX.as_bytes());
+    let mandatory_values: Vec<_> = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-myservice-id"))
+        .map(|(_, value)| value.trim())
+        .collect();
     let body = serde_json::json!({
         "body_resolved": body_resolved,
         "header_resolved": header_resolved,
         "saw_placeholder": saw_placeholder,
+        "mandatory_header_resolved": mandatory_values.len() == 1 && mandatory_values[0] == TEST_SECRET,
     })
     .to_string();
     let response = format!(
@@ -1563,9 +1570,7 @@ print("CHUNKED_PIPELINE_DENIED")
 #[tokio::test]
 #[serial(proxy_egress_pipeline)]
 async fn http_credentials_are_rewritten_in_transparent_headers_and_bodies() {
-    let _provider_lock = PROVIDER_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _provider_lock = PROVIDER_LOCK.lock().await;
     delete_provider(PROVIDER_NAME).await;
     delete_provider_profile(PROVIDER_PROFILE_ID).await;
 
@@ -1680,4 +1685,100 @@ print(json.dumps({{"first": request_once(), "second": request_once()}}, sort_key
         "sandbox output exposed an unresolved provider placeholder:\n{}",
         guard.create_output
     );
+}
+
+#[cfg(feature = "e2e-mandatory-static-auth")]
+#[tokio::test]
+#[serial(proxy_egress_pipeline)]
+async fn mandatory_static_auth_overwrites_workload_credentials() {
+    let _provider_lock = PROVIDER_LOCK.lock().await;
+    delete_provider(PROVIDER_NAME).await;
+    delete_provider_profile(PROVIDER_PROFILE_ID).await;
+    let result = async {
+        let server = CredentialProbeServer::start().await?;
+        let profile = write_credential_profile(server.port)?;
+        run_cli(&["profile", "import", "--file", &policy_path(&profile)]).await?;
+        create_bound_provider(PROVIDER_NAME).await?;
+        let middleware = format!(
+            r"network_middlewares:
+  mandatory:
+    middleware: acme/myservice-auth
+    order: 2147483647
+    on_error: fail_closed
+    endpoints:
+      include: [{TEST_SERVER_HOST}]
+    config:
+      credential_env: {TOKEN_ENV}
+      header_name: X-MyService-ID
+"
+        );
+        let policy = write_policy_document(
+            TEST_SERVER_HOST,
+            server.port,
+            "        protocol: rest\n        enforcement: enforce\n        access: full",
+            &middleware,
+        )?;
+        let script = format!(
+            r#"
+import json
+import os
+import socket
+
+def request(headers):
+    with socket.create_connection(({host:?}, {port}), timeout=10) as sock:
+        sock.sendall((
+            "GET /probe HTTP/1.1\r\n"
+            "Host: {host}:{port}\r\n"
+            + headers + "Connection: close\r\n\r\n"
+        ).encode())
+        response = sock.makefile("rb")
+        status = int(response.readline().split()[1])
+        length = 0
+        while True:
+            line = response.readline()
+            if line == b"\r\n":
+                break
+            if not line:
+                raise RuntimeError("incomplete response headers")
+            if line.lower().startswith(b"content-length:"):
+                length = int(line.split(b":", 1)[1])
+        if status != 200:
+            raise RuntimeError(f"mandatory authentication returned HTTP {{status}}")
+        return json.loads(response.read(length))["mandatory_header_resolved"]
+
+inputs = [
+    "",
+    "X-MyService-ID: synthetic-foreign-token\r\n",
+    "X-MYSERVICE-ID: first\r\nx-myservice-id: second\r\n",
+    "X-MyService-ID: " + os.environ[{token_env:?}] + "\r\n",
+]
+print(json.dumps({{"authenticated": [request(headers) for headers in inputs]}}))
+"#,
+            host = TEST_SERVER_HOST,
+            port = server.port,
+            token_env = TOKEN_ENV
+        );
+        SandboxGuard::create(&[
+            "--policy",
+            &policy_path(&policy),
+            "--provider",
+            PROVIDER_NAME,
+            "--",
+            "python3",
+            "-c",
+            &script,
+        ])
+        .await
+    }
+    .await;
+    delete_provider(PROVIDER_NAME).await;
+    delete_provider_profile(PROVIDER_PROFILE_ID).await;
+    let guard = result.expect("custom-build mandatory authentication sandbox");
+    let result = parse_json_line(&guard.create_output);
+    assert_eq!(
+        result["authenticated"],
+        serde_json::json!([true, true, true, true])
+    );
+    assert!(!guard.create_output.contains(TEST_SECRET));
+    assert!(!guard.create_output.contains(PLACEHOLDER_PREFIX));
 }

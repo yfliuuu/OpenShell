@@ -134,3 +134,15 @@ and write/flush/shutdown. No live Gateway/Podman validation or production
 qualification is claimed. CLI displayed-snapshot binding (step 5),
 durable decision history/CAS and the full executor fence remain gaps. OCSF
 correlation must not include request bytes, queries, review tokens or secrets.
+
+## Local credential provenance
+
+Local authentication middleware can return typed credential provenance alongside
+HTTP mutations. Carry it through request rebuilding into each request's
+`L7EvalContext`, independently of the connection's credential state. Inspected,
+passthrough, and forward-proxy dispatch guards validate the originating
+installation and expiry before writes. Do not overwrite that pin when later
+credential preparation reads the live state.
+
+The opt-in handler and its verification commands are documented in
+[built-in middleware](../openshell-supervisor-middleware-builtins/README.md).

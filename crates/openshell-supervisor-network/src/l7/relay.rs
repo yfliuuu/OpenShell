@@ -42,6 +42,8 @@ mod held;
 pub(crate) use held::relay_held_rest_once;
 
 #[cfg(test)]
+mod mandatory_auth_tests;
+#[cfg(test)]
 mod token_grant_ownership_tests;
 
 const CONNECTION_READ_AHEAD_BYTES: usize = 8 * 1024;
