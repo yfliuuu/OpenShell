@@ -62,6 +62,24 @@ impl HostSelector {
             && !self.excludes.iter().any(|pattern| pattern.matches(host))
     }
 
+    /// Conservatively prove that every host in a pattern is selected.
+    ///
+    /// Wildcard scopes need a verbatim or universal include and no potentially
+    /// overlapping exclusion. Literal hosts can use any matching include.
+    #[must_use]
+    pub fn covers_pattern(&self, candidate: &HostPattern) -> bool {
+        if let Some(host) = candidate.literal() {
+            return self.matches(host);
+        }
+        self.includes
+            .iter()
+            .any(|include| include.is_universal() || include.source == candidate.source)
+            && !self
+                .excludes
+                .iter()
+                .any(|excluded| excluded.overlaps(candidate))
+    }
+
     /// Conservatively determine whether this selector can match a concrete
     /// host admitted by `candidate`.
     #[must_use]
@@ -178,7 +196,9 @@ impl HostPattern {
         matches!(self.labels.as_slice(), [HostLabelPattern::Recursive])
     }
 
-    fn overlaps(&self, other: &Self) -> bool {
+    /// Conservatively determine whether two patterns can select the same host.
+    #[must_use]
+    pub fn overlaps(&self, other: &Self) -> bool {
         let mut pending = VecDeque::from([(0, 0)]);
         let mut visited = HashSet::new();
         while let Some((left_idx, right_idx)) = pending.pop_front() {
@@ -349,5 +369,20 @@ mod tests {
 
         assert!(!selector_may_match_pattern(&include, &exclude, "api.example.com").unwrap());
         assert!(selector_may_match_pattern(&include, &exclude, "*.example.com").unwrap());
+    }
+
+    #[test]
+    fn selector_coverage_requires_the_entire_rule_scope() {
+        let selector =
+            HostSelector::new(&["*.example.com".into()], &["excluded.example.com".into()]).unwrap();
+        assert!(selector.covers_pattern(&HostPattern::new("API.example.com").unwrap()));
+        assert!(!selector.covers_pattern(&HostPattern::new("excluded.example.com").unwrap()));
+        assert!(!selector.covers_pattern(&HostPattern::new("*.example.com").unwrap()));
+        assert!(!selector.covers_pattern(&HostPattern::new("*.other.com").unwrap()));
+        let selector = HostSelector::new(&["**".into()], &[]).unwrap();
+        assert!(selector.covers_pattern(&HostPattern::new("*.example.com").unwrap()));
+        let selector = HostSelector::new(&["*.example.com".into()], &[]).unwrap();
+        assert!(selector.covers_pattern(&HostPattern::new("*.EXAMPLE.com").unwrap()));
+        assert!(!selector.covers_pattern(&HostPattern::new("**.example.com").unwrap()));
     }
 }

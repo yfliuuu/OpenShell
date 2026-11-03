@@ -181,7 +181,7 @@ A denial from middleware always blocks traffic, regardless of `on_error`. Middle
 
 Custom gateway and supervisor binaries built with the `mandatory-static-auth` feature provide `acme/myservice-auth` as in-process middleware. Default builds do not register it. It requires gateway-managed sandbox configuration and no external middleware service.
 
-Attach a provider with a declared static credential key and endpoint binding, then add an independent mandatory attachment:
+Attach providers with distinct static credential keys and endpoint bindings, then add one independent mandatory attachment:
 
 ```yaml showLineNumbers={false}
 network_middlewares:
@@ -190,15 +190,30 @@ network_middlewares:
     order: 2147483647
     on_error: fail_closed
     endpoints:
-      include: [api.myservice.example]
+      include: [api.service-1.com, api.service-2.com]
     config:
-      credential_env: MYSERVICE_TOKEN
-      header_name: X-MyService-ID
+      rules:
+        - host: api.service-1.com
+          port: 443
+          path: "/**"
+          credential_env: SERVICE_1_TOKEN
+          header_name: X-MyService-ID
+        - host: api.service-2.com
+          port: 443
+          path: "/**"
+          credential_env: SERVICE_2_TOKEN
+          header_name: X-MyService2-ID
 ```
 
-The handler supports only `X-MyService-ID` and replaces every existing value with the sandbox's current credential. The maximum order makes it the last request middleware. Dynamic token grants targeting the same header on overlapping hosts are incompatible and prevent supervisor activation.
+Each selected request must match exactly one rule. The handler replaces every existing value of that rule's custom header with the sandbox's current endpoint-authorized credential. It never falls back to another rule or provider. Unmatched ports and paths on selected hosts fail closed; traffic outside the attachment selector follows normal network policy.
 
-Keep the attachment outside provider-generated policy so detaching a provider cannot remove enforcement. After detachment or revocation activates, protected requests fail closed until an authorized replacement becomes available. Rotation applies to subsequent requests on existing connections. Requests prepared with a replaced installation or an expired credential cannot dispatch.
+Configure 1-64 rules, each with all five fields shown above. Host patterns follow network policy semantics; `/v1/**` paths include `/v1`, and query strings do not affect selection. Admission rejects potentially overlapping rules. Exact paths and subtrees can prove disjointness; general path globs may be conservatively rejected. The attachment's host selector must cover every rule host. Wildcard rules require a verbatim include or `**`, with no overlapping exclusion.
+
+Ordinary custom headers can differ between rules. Protected headers such as `Authorization`, `Cookie`, framing/hop-by-hop headers, and reserved AWS/OpenShell headers remain unsupported. The legacy `config: {credential_env: MYSERVICE_TOKEN, header_name: X-MyService-ID}` form remains supported; do not combine it with `rules`.
+
+The maximum order makes this the last request middleware. Dynamic token grants targeting a rule's header on potentially overlapping host/port/path scopes prevent supervisor activation. Other headers or disjoint scopes can coexist. Legacy configurations retain host-wide conflict checks.
+
+Keep the attachment outside provider-generated policy so detaching a provider cannot remove enforcement. After detachment or revocation activates, requests selecting that provider fail closed until an authorized replacement becomes available; other rules can continue using their own credentials. Rotation applies to subsequent requests on existing connections. Requests prepared with a replaced installation or an expired credential cannot dispatch.
 
 The request body limit is 256 KiB. Existing buffering and inspected HTTP protocol limitations still apply. The service must treat this header as authoritative and must not expose the credential in responses. Refer to the [custom-build implementation and verification guide](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-supervisor-middleware-builtins/README.md) for build instructions.
 

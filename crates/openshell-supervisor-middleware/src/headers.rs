@@ -4,6 +4,7 @@
 //! Validation and logical application of HTTP middleware header mutations.
 
 use openshell_core::{
+    middleware::{is_protected_request_header as is_request_protected, is_valid_http_header_name},
     proto::{ExistingHeaderAction, HeaderMutation, HttpHeader, header_mutation},
     secrets::header_value_contains_reserved_credential_marker,
 };
@@ -219,7 +220,7 @@ fn enforce_size_limit(mutation_bytes: usize) -> Result<(), HeaderMutationError> 
 
 fn validate_name(name: &str) -> Result<String, HeaderMutationError> {
     let lower = name.to_ascii_lowercase();
-    if lower.is_empty() || !lower.bytes().all(is_name_token_byte) {
+    if !is_valid_http_header_name(&lower) {
         return Err(HeaderMutationError::InvalidName {
             name: name.to_string(),
         });
@@ -255,27 +256,6 @@ fn validate_authority(
     Ok(())
 }
 
-fn is_name_token_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        || matches!(
-            byte,
-            b'!' | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'.'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'|'
-                | b'~'
-        )
-}
-
 /// A header value is safe to write only if it contains no control characters.
 /// Horizontal tab, printable ASCII, and obs-text (>= 0x80) are permitted; CR, LF,
 /// NUL, and other control bytes are rejected.
@@ -283,26 +263,6 @@ fn is_safe_value(value: &str) -> bool {
     value
         .bytes()
         .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte) || byte >= 0x80)
-}
-
-fn is_request_protected(name: &str) -> bool {
-    matches!(
-        name,
-        "authorization"
-            | "proxy-authorization"
-            | "proxy-authenticate"
-            | "cookie"
-            | "host"
-            | "content-length"
-            | "transfer-encoding"
-            | "connection"
-            | "proxy-connection"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "upgrade"
-    ) || name.starts_with("x-amz-")
-        || name.starts_with("x-openshell-credential")
 }
 
 /// Return whether a response header can carry authentication material and must

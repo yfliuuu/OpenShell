@@ -206,3 +206,254 @@ async fn mandatory_auth_concurrent_states_remain_isolated() {
         exercise_live_authentication("synthetic-c", true),
     );
 }
+
+fn endpoint_rule_relay(
+    engine: Arc<OpaEngine>,
+    credentials: ProviderCredentialState,
+    host: &str,
+    inspected: bool,
+) -> (
+    DuplexStream,
+    DuplexStream,
+    tokio::task::JoinHandle<Result<()>>,
+) {
+    let ctx = L7EvalContext {
+        host: host.into(),
+        port: 8080,
+        request_default_port: Some(if inspected { 443 } else { 80 }),
+        policy_name: "service".into(),
+        binary_path: "/usr/bin/curl".into(),
+        provider_credentials: Some(credentials),
+        ..Default::default()
+    };
+    let (endpoint, generation) = engine
+        .query_endpoint_config_with_generation(&middleware_network_input(&ctx))
+        .unwrap();
+    let config = crate::l7::parse_l7_config(&endpoint.unwrap()).unwrap();
+    let tunnel = engine.clone_engine_for_tunnel(generation).unwrap();
+    let guard = tunnel.generation_guard().clone();
+    let (app, mut client) = tokio::io::duplex(8192);
+    let (mut upstream, service) = tokio::io::duplex(8192);
+    let relay = tokio::spawn(async move {
+        if inspected {
+            relay_with_inspection(&config, tunnel, &mut client, &mut upstream, &ctx).await
+        } else {
+            relay_passthrough_with_credentials(
+                &mut client,
+                &mut upstream,
+                &ctx,
+                &guard,
+                Some(&engine),
+            )
+            .await
+        }
+    });
+    (app, service, relay)
+}
+
+async fn check_rule_headers(
+    app: &mut DuplexStream,
+    service: &mut DuplexStream,
+    host: &str,
+    header: &str,
+    token: &str,
+) {
+    for input in [
+        String::new(),
+        format!("{header}: synthetic-foreign\r\n"),
+        format!(
+            "{}: first\r\n{}: second\r\n",
+            header.to_ascii_uppercase(),
+            header.to_ascii_lowercase()
+        ),
+        format!("{header}: openshell:resolve:env:UNKNOWN\r\n"),
+    ] {
+        app.write_all(
+            format!("GET /v1/items?limit=1 HTTP/1.1\r\nHost: {host}:8080\r\n{input}\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let forwarded = read_headers(service).await;
+        let forwarded = std::str::from_utf8(&forwarded).unwrap();
+        let values = forwarded
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case(header))
+            .map(|(_, value)| value.trim())
+            .collect::<Vec<_>>();
+        assert_eq!(values, [token]);
+        assert!(!forwarded.contains("synthetic-foreign"));
+        service
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_headers(app).await.starts_with(b"HTTP/1.1 200"));
+    }
+}
+
+#[tokio::test]
+async fn mandatory_auth_endpoint_rules_isolate_two_providers_on_live_connections() {
+    for inspected in [false, true] {
+        let mut event_context = openshell_ocsf::ctx::ctx().clone();
+        event_context.sandbox_id = "mandatory-auth-test".into();
+        let _ = openshell_ocsf::ctx::set_ctx(event_context);
+        let mut all_bindings = bindings();
+        let mut second_binding = all_bindings["MYSERVICE_TOKEN"].clone();
+        second_binding.credential_identity = "provider2:service_token".into();
+        second_binding.endpoints[0].host = "api.myservice2.example".into();
+        all_bindings.insert("MYSERVICE2_TOKEN".into(), second_binding);
+        let mut env = HashMap::from([
+            ("MYSERVICE_TOKEN".into(), "synthetic-one".into()),
+            ("MYSERVICE2_TOKEN".into(), "synthetic-two".into()),
+        ]);
+        let credentials = ProviderCredentialState::from_bound_environment(
+            1,
+            env.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            all_bindings.clone(),
+            Vec::new(),
+        )
+        .unwrap();
+        let policy = openshell_policy::parse_sandbox_policy(r"
+version: 1
+network_middlewares:
+  mandatory:
+    middleware: acme/myservice-auth
+    order: 2147483647
+    on_error: fail_closed
+    endpoints:
+      include: [api.myservice.example, api.myservice2.example]
+    config:
+      rules:
+        - host: api.myservice.example
+          port: 8080
+          path: /v1/**
+          credential_env: MYSERVICE_TOKEN
+          header_name: X-MyService-ID
+        - host: api.myservice2.example
+          port: 8080
+          path: /v1/**
+          credential_env: MYSERVICE2_TOKEN
+          header_name: X-MyService2-ID
+network_policies:
+  service:
+    endpoints:
+      - {host: api.myservice.example, port: 8080, protocol: rest, enforcement: enforce, access: full}
+      - {host: api.myservice2.example, port: 8080, protocol: rest, enforcement: enforce, access: full}
+    binaries:
+      - path: /usr/bin/curl
+").unwrap();
+        openshell_supervisor_middleware_builtins::mandatory_auth::validate_policy(
+            &policy,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let engine = Arc::new(OpaEngine::from_proto(&policy).unwrap());
+        let registry = MiddlewareRegistry::connect_services(
+            vec![Arc::new(
+                MandatoryAuthService::for_sandbox(
+                    openshell_ocsf::ctx::ctx().sandbox_id.clone(),
+                    credentials.clone(),
+                )
+                .unwrap(),
+            )],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        engine.replace_middleware_registry(registry).unwrap();
+        let (mut app1, mut service1, relay1) = endpoint_rule_relay(
+            engine.clone(),
+            credentials.clone(),
+            "api.myservice.example",
+            inspected,
+        );
+        let (mut app2, mut service2, relay2) = endpoint_rule_relay(
+            engine,
+            credentials.clone(),
+            "api.myservice2.example",
+            inspected,
+        );
+        tokio::join!(
+            check_rule_headers(
+                &mut app1,
+                &mut service1,
+                "api.myservice.example",
+                "X-MyService-ID",
+                "synthetic-one"
+            ),
+            check_rule_headers(
+                &mut app2,
+                &mut service2,
+                "api.myservice2.example",
+                "X-MyService2-ID",
+                "synthetic-two"
+            ),
+        );
+        env.insert("MYSERVICE_TOKEN".into(), "synthetic-rotated".into());
+        credentials
+            .install_bound_environment(
+                2,
+                env.clone(),
+                HashMap::new(),
+                HashMap::new(),
+                all_bindings.clone(),
+                Vec::new(),
+            )
+            .unwrap();
+        tokio::join!(
+            check_rule_headers(
+                &mut app1,
+                &mut service1,
+                "api.myservice.example",
+                "X-MyService-ID",
+                "synthetic-rotated"
+            ),
+            check_rule_headers(
+                &mut app2,
+                &mut service2,
+                "api.myservice2.example",
+                "X-MyService2-ID",
+                "synthetic-two"
+            ),
+        );
+        env.remove("MYSERVICE_TOKEN");
+        all_bindings.remove("MYSERVICE_TOKEN");
+        credentials
+            .install_bound_environment(
+                3,
+                env,
+                HashMap::new(),
+                HashMap::new(),
+                all_bindings,
+                Vec::new(),
+            )
+            .unwrap();
+        app1.write_all(b"GET /v1/items HTTP/1.1\r\nHost: api.myservice.example:8080\r\nX-MyService-ID: synthetic-two\r\n\r\n").await.unwrap();
+        assert!(!read_headers(&mut app1).await.starts_with(b"HTTP/1.1 200"));
+        tokio::time::timeout(Duration::from_secs(3), relay1)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut leaked = Vec::new();
+        service1.read_to_end(&mut leaked).await.unwrap();
+        assert!(leaked.is_empty());
+        check_rule_headers(
+            &mut app2,
+            &mut service2,
+            "api.myservice2.example",
+            "X-MyService2-ID",
+            "synthetic-two",
+        )
+        .await;
+        drop(app2);
+        tokio::time::timeout(Duration::from_secs(3), relay2)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}

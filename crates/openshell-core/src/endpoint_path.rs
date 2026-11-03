@@ -57,6 +57,37 @@ impl EndpointPathPattern {
             EndpointPathPatternKind::Invalid => false,
         }
     }
+
+    /// Whether the pattern has valid syntax under endpoint matching semantics.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !matches!(self.kind, EndpointPathPatternKind::Invalid)
+    }
+
+    /// Conservatively determine whether two patterns may select the same path.
+    ///
+    /// Exact paths and subtrees can prove disjointness. General globs that
+    /// cannot be compared exactly are treated as potentially overlapping.
+    #[must_use]
+    pub fn may_overlap(&self, other: &Self) -> bool {
+        let literal = |pattern: &Self| {
+            matches!(pattern.kind, EndpointPathPatternKind::Invalid)
+                || matches!(pattern.kind, EndpointPathPatternKind::Glob(_))
+                    && !pattern.source.contains(['*', '?', '['])
+        };
+        if literal(self) {
+            return other.matches(&self.source);
+        }
+        if literal(other) {
+            return self.matches(&other.source);
+        }
+        match (&self.kind, &other.kind) {
+            (EndpointPathPatternKind::Subtree(left), EndpointPathPatternKind::Subtree(right)) => {
+                self.matches(right) || other.matches(left)
+            }
+            _ => true,
+        }
+    }
 }
 
 /// Return whether `path` is selected by a provider endpoint path pattern.
@@ -71,6 +102,29 @@ pub fn matches(pattern: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{EndpointPathPattern, matches};
+
+    #[test]
+    fn endpoint_path_overlap_is_conservative_and_respects_subtree_boundaries() {
+        for (left, right, expected) in [
+            ("/**", "/v1/items", true),
+            ("/v1/**", "/v1", true),
+            ("/v1/**", "/v10/**", false),
+            ("/v1/**", "/v2/**", false),
+            ("/v1/**", "/v1/items/**", true),
+            ("/v1/items", "/v1/other", false),
+            ("/v*/items", "/v1/items", true),
+            ("/v*/items", "/v1/other", false),
+            ("/v*/items", "/other/*", true),
+            ("/bad[", "/**", true),
+        ] {
+            let left = EndpointPathPattern::new(left);
+            let right = EndpointPathPattern::new(right);
+            assert_eq!(left.may_overlap(&right), expected);
+            assert_eq!(right.may_overlap(&left), expected);
+        }
+        assert!(!EndpointPathPattern::new("/bad[").is_valid());
+        assert!(EndpointPathPattern::new("/v*/items").is_valid());
+    }
 
     #[test]
     fn matches_canonical_endpoint_patterns() {

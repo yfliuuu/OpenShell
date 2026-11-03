@@ -638,7 +638,10 @@ messages when the implementation advertises the matching binding. The built-in
 `acme/myservice-auth` is available only in custom gateway and supervisor builds
 with mandatory static authentication enabled. It is in-process, not an external
 registration. Follow the [custom-build configuration requirements](https://docs.nvidia.com/openshell/latest/extensibility/supervisor-middleware/configure.md#mandatory-static-authentication-in-custom-builds)
-before selecting it.
+before selecting it. For multiple providers, configure endpoint rules in one
+maximum-order attachment, with distinct credential keys and per-rule custom
+headers. Unmatched selected traffic fails closed; protected headers remain
+unsupported.
 Use the `generate-sandbox-policy` skill to choose attachments and failure policy,
 and `debug-openshell-cluster` to investigate middleware failures.
 
