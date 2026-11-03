@@ -11,6 +11,12 @@ pub async fn validate_policy(
     registry: &MiddlewareRegistry,
     policy: &SandboxPolicy,
 ) -> Result<(), Status> {
+    #[cfg(feature = "mandatory-static-auth")]
+    openshell_supervisor_middleware_builtins::mandatory_auth::validate_policy(
+        policy,
+        &std::collections::HashMap::new(),
+    )
+    .map_err(|error| Status::invalid_argument(error.to_string()))?;
     async {
         registry.validate_policy_configs(policy).await?;
         registry.validate_http_hook_rules(policy).await
@@ -223,6 +229,46 @@ mod tests {
         )
         .await
         .expect("no HTTP operation is served by both hook versions");
+    }
+
+    #[cfg(feature = "mandatory-static-auth")]
+    #[tokio::test]
+    async fn mandatory_auth_validates_configuration_without_runtime_credentials() {
+        let registry = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut policy = openshell_policy::parse_sandbox_policy(
+            r"
+version: 1
+network_middlewares:
+  mandatory:
+    middleware: acme/myservice-auth
+    order: 2147483647
+    on_error: fail_closed
+    endpoints:
+      include: [api.myservice.example]
+    config:
+      credential_env: MYSERVICE_TOKEN
+      header_name: X-MyService-ID
+",
+        )
+        .unwrap();
+        validate_policy(&registry, &policy).await.unwrap();
+        policy
+            .network_middlewares
+            .get_mut("mandatory")
+            .unwrap()
+            .order = 0;
+        assert_eq!(
+            validate_policy(&registry, &policy)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
     }
 
     #[tokio::test]

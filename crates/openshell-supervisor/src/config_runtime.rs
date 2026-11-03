@@ -430,28 +430,39 @@ impl ConfigRuntime {
         let mut runtime_error = String::new();
         if policy_runtime_changed {
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
-            let runtime_result = reload_gateway_configuration_runtime(
-                &ctx.opa_engine,
-                result.policy.as_ref(),
-                pid,
-                MiddlewareReloadContext {
-                    desired_services: &result.supervisor_middleware_services,
-                    authentication: &MiddlewareAuthentication {
-                        credentials: middleware_credentials.clone(),
-                        enabled: result.extension_authentication_enabled,
-                    },
-                    registry_changed: middleware_registry_changed,
-                    connector: &ctx.middleware_connector,
-                },
-                ctx.vm_identity,
-                || {
-                    if let Some(prepared) = prepared_provider.as_ref() {
-                        ctx.provider_credentials
-                            .install_prepared(&prepared.credentials);
-                    }
-                },
-            )
-            .await;
+            let credentials = prepared_provider
+                .as_ref()
+                .map_or(&ctx.provider_credentials, |prepared| &prepared.credentials);
+            let auth_validation = result.policy.as_ref().map_or(Ok(()), |policy| {
+                super::validate_mandatory_auth_configuration(policy, credentials)
+            });
+            let runtime_result = match auth_validation {
+                Err(error) => Err(super::GatewayRuntimeReloadError::PolicyValidation(error)),
+                Ok(()) => {
+                    reload_gateway_configuration_runtime(
+                        &ctx.opa_engine,
+                        result.policy.as_ref(),
+                        pid,
+                        MiddlewareReloadContext {
+                            desired_services: &result.supervisor_middleware_services,
+                            authentication: &MiddlewareAuthentication {
+                                credentials: middleware_credentials.clone(),
+                                enabled: result.extension_authentication_enabled,
+                            },
+                            registry_changed: middleware_registry_changed,
+                            connector: &ctx.middleware_connector,
+                        },
+                        ctx.vm_identity,
+                        || {
+                            if let Some(prepared) = prepared_provider.as_ref() {
+                                ctx.provider_credentials
+                                    .install_prepared(&prepared.credentials);
+                            }
+                        },
+                    )
+                    .await
+                }
+            };
 
             match runtime_result {
                 Ok(generation) => {
@@ -2058,6 +2069,152 @@ mod tests {
             );
         }
         result
+    }
+
+    #[cfg(feature = "mandatory-static-auth")]
+    #[tokio::test]
+    async fn mandatory_auth_detachment_activates_with_last_known_good_retention() {
+        use openshell_core::proto::{
+            ConfigApplyOutcome, PolicySource, ProviderEnvironmentSnapshot,
+            ProviderEnvironmentValue, ProviderEnvironmentValueClassification,
+        };
+        let policy = crate::tests::mandatory_auth_policy_fixture();
+        let mut initial = settings_poll_result(Some(policy.clone()), 1, PolicySource::Sandbox);
+        initial.provider_env_revision = 1;
+        initial.policy_validation_failure_mode = PolicyValidationFailureMode::RetainLastValid;
+        let state =
+            prepare_provider_environment(&static_provider_environment(1, Some("synthetic-a")))
+                .unwrap();
+        let connector = middleware_connector_for_sandbox("sandbox-test".into(), state.clone());
+        let registry = connector(Vec::new(), MiddlewareAuthentication::default())
+            .await
+            .unwrap();
+        let runner = openshell_supervisor_middleware::ChainRunner::from_registry(registry.clone());
+        let engine = Arc::new(OpaEngine::from_proto(&policy).unwrap());
+        engine.replace_middleware_registry(registry).unwrap();
+        let mut ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            connector.clone(),
+        );
+        ctx.provider_credentials = state.clone();
+        let mut runtime = started_runtime(&ctx, &initial);
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let entry = openshell_supervisor_middleware::ChainEntry::try_from((
+            "mandatory",
+            &policy.network_middlewares["mandatory"],
+        ))
+        .unwrap();
+        let request = || openshell_supervisor_middleware::HttpRequestInput {
+            request_id: "request".into(),
+            sandbox_id: "sandbox-test".into(),
+            sandbox_name: "sandbox-test".into(),
+            workspace: "workspace".into(),
+            scheme: "https".into(),
+            host: "tools.example.com".into(),
+            port: 443,
+            method: "GET".into(),
+            path: "/v1/items".into(),
+            query: String::new(),
+            headers: Vec::new(),
+            connection_nominated_headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let first = runner
+            .evaluate(std::slice::from_ref(&entry), request())
+            .await
+            .unwrap();
+        assert!(first.allowed);
+        let original_pin = first.credential_provenance[0].clone();
+        for (revision, value) in [(2, None), (3, Some("synthetic-replacement"))] {
+            let mut desired = initial.clone();
+            desired.config_revision = revision * 100;
+            desired.provider_env_revision = revision;
+            let environment = static_provider_environment(revision, value);
+            let delivered = ProviderEnvironmentSnapshot {
+                provider_env_revision: revision,
+                policy_hash: desired.policy_hash.clone(),
+                values: environment
+                    .environment
+                    .into_iter()
+                    .map(|(name, value)| ProviderEnvironmentValue {
+                        static_credential_binding: environment
+                            .static_credential_bindings
+                            .get(&name)
+                            .cloned(),
+                        name,
+                        value,
+                        classification: ProviderEnvironmentValueClassification::StaticCredential
+                            .into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let applied = runtime
+                .apply_delivered_sandbox(&ctx, &client, desired, delivered)
+                .await;
+            assert_eq!(applied.outcome, ConfigApplyOutcome::Applied);
+            assert!(engine.fail_closed_reason().is_none());
+            assert!(original_pin.ensure_current(&state).is_err());
+            let outcome = runner
+                .evaluate(std::slice::from_ref(&entry), request())
+                .await
+                .unwrap();
+            assert_eq!(outcome.allowed, value.is_some());
+            let rebuilt = connector(Vec::new(), MiddlewareAuthentication::default())
+                .await
+                .unwrap();
+            let rebuilt = openshell_supervisor_middleware::ChainRunner::from_registry(rebuilt);
+            assert_eq!(
+                rebuilt
+                    .evaluate(std::slice::from_ref(&entry), request())
+                    .await
+                    .unwrap()
+                    .allowed,
+                value.is_some()
+            );
+        }
+        let mut conflicting = initial;
+        conflicting.config_revision = 400;
+        conflicting.provider_env_revision = 4;
+        let key = openshell_core::dynamic_credential_key::DynamicCredentialKey::new(
+            "tools.example.com",
+            443,
+            "/v1/**",
+            "owner",
+            "provider",
+            "token",
+        )
+        .unwrap()
+        .encode();
+        let delivered = ProviderEnvironmentSnapshot {
+            provider_env_revision: 4,
+            policy_hash: conflicting.policy_hash.clone(),
+            dynamic_credentials: std::collections::HashMap::from([(
+                key,
+                openshell_core::proto::ProviderProfileCredential {
+                    auth_style: "header".into(),
+                    header_name: "x-myservice-id".into(),
+                    token_grant: Some(
+                        openshell_core::proto::ProviderCredentialTokenGrant::default(),
+                    ),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let rejected = runtime
+            .apply_delivered_sandbox(&ctx, &client, conflicting, delivered)
+            .await;
+        assert_eq!(
+            rejected.outcome,
+            ConfigApplyOutcome::FailedRetainedLastKnownGood
+        );
+        assert_eq!(state.revision(), 3);
     }
 
     #[test]
