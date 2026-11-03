@@ -119,8 +119,8 @@ where
         RequestBodyDelivery::Withhold { max_bytes: 0 },
     )
     .await?;
-    let request = match middleware_result {
-        MiddlewareApplyResult::Allowed(request) => request,
+    let (request, credential_provenance) = match middleware_result {
+        MiddlewareApplyResult::Allowed(request, provenance) => (request, provenance),
         result => {
             let denied = L7Request {
                 action: info.action.clone(),
@@ -165,10 +165,13 @@ where
                 MiddlewareApplyResult::Streamed { .. } => {
                     Err(miette!("held REST middleware must not stream a body"))
                 }
-                MiddlewareApplyResult::Allowed(_) => unreachable!(),
+                MiddlewareApplyResult::Allowed(..) => unreachable!(),
             };
         }
     };
+    let mut forwarding_ctx = ctx.clone();
+    forwarding_ctx.middleware_credential_provenance = credential_provenance;
+    let ctx = &forwarding_ctx;
     if validate_bodyless_request(&request, config)? != frozen_line
         || request.action != info.action
         || request.target != info.target

@@ -94,6 +94,7 @@ impl HeldProposalInput {
             provider_credentials: None,
             provider_credential_revision: None,
             provider_credential_installation_id: None,
+            middleware_credential_provenance: Vec::new(),
             body_classifier: None,
             activity_tx: None,
             token_grant_resolver: None,

@@ -5389,6 +5389,7 @@ async fn inject_token_grant_for_forward_request(
 
     // L4-only forwarding keeps selector-based credentials; it has no inspected
     // endpoint owner decision. Inspected requests always use preparation above.
+    l7_ctx.ensure_middleware_credentials_current()?;
     let Some(snapshot) = crate::l7::token_grant_injection::pin_live_credentials(l7_ctx) else {
         return Ok(request.raw_header);
     };
@@ -6483,7 +6484,10 @@ async fn handle_forward_proxy_in_slot(
         };
         let middleware_result = pipeline.apply(request, client).await?;
         forward_request_bytes = match middleware_result {
-            crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request.raw_header,
+            crate::l7::middleware::MiddlewareApplyResult::Allowed(request, provenance) => {
+                l7_ctx.middleware_credential_provenance = provenance;
+                request.raw_header
+            }
             crate::l7::middleware::MiddlewareApplyResult::Streamed { .. } => {
                 return Err(miette::miette!(
                     "forward proxy request middleware must withhold its output"
@@ -6652,7 +6656,8 @@ async fn handle_forward_proxy_in_slot(
     ) {
         (Some(state), Some(revision)) => Some(
             crate::l7::rest::CredentialGenerationGuard::new(state, revision)
-                .with_installation_id(l7_ctx.provider_credential_installation_id.as_deref()),
+                .with_installation_id(l7_ctx.provider_credential_installation_id.as_deref())
+                .with_middleware_provenance(&l7_ctx.middleware_credential_provenance),
         ),
         _ => None,
     };
@@ -10796,7 +10801,7 @@ network_policies:
             crate::l7::middleware::MiddlewareApplyResult::Denied { denial, .. } => {
                 assert!(denial.is_none());
             }
-            crate::l7::middleware::MiddlewareApplyResult::Allowed(_) => {
+            crate::l7::middleware::MiddlewareApplyResult::Allowed(..) => {
                 panic!("policy-invalid transformed request must be denied")
             }
             crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
@@ -10896,7 +10901,7 @@ network_policies:
         };
         let (outcome, ()) = tokio::join!(pipeline.apply(request, &mut client), revoke);
         let request = match outcome.expect("middleware pipeline") {
-            crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request,
+            crate::l7::middleware::MiddlewareApplyResult::Allowed(request, _) => request,
             crate::l7::middleware::MiddlewareApplyResult::Denied { .. } => {
                 panic!("blocking middleware should allow after release")
             }
@@ -13804,7 +13809,7 @@ network_policies:
             .apply(request, &mut client)
             .await
             .expect("middleware pipeline");
-        let crate::l7::middleware::MiddlewareApplyResult::Allowed(request) = allowed else {
+        let crate::l7::middleware::MiddlewareApplyResult::Allowed(request, _) = allowed else {
             panic!("middleware-selected request should be allowed");
         };
         let rewritten = rewrite_forward_request(

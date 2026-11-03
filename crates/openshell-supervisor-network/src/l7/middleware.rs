@@ -64,7 +64,10 @@ pub async fn close_after_early_response<C: AsyncRead + AsyncWrite + Unpin>(
 }
 
 pub enum MiddlewareApplyResult {
-    Allowed(crate::l7::provider::L7Request),
+    Allowed(
+        crate::l7::provider::L7Request,
+        Vec<openshell_core::provider_credentials::CredentialProvenance>,
+    ),
     /// HTTP hook request middleware streams the body. `request` holds
     /// only the head; the relay commits it on the middleware's final `Start`.
     Streamed {
@@ -259,7 +262,7 @@ impl HttpMiddlewareExchange {
         )
         .await?;
         let forwarded = match &result {
-            MiddlewareApplyResult::Allowed(request) => Some(ForwardedRequestHead::new(request)),
+            MiddlewareApplyResult::Allowed(request, _) => Some(ForwardedRequestHead::new(request)),
             MiddlewareApplyResult::Streamed { request, body } => {
                 Some(ForwardedRequestHead::of(request, Some(body)))
             }
@@ -826,7 +829,7 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery<
     delivery: RequestBodyDelivery,
 ) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
-        return Ok(MiddlewareApplyResult::Allowed(req));
+        return Ok(MiddlewareApplyResult::Allowed(req, Vec::new()));
     }
     let chain = runner.describe_chain(&chain).await?;
     match openshell_supervisor_middleware::chain_http_hook_version(&chain) {
@@ -936,7 +939,7 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
             .await?;
         emit_middleware_events(ctx, &req, &outcome);
         return Ok(if outcome.allowed {
-            MiddlewareApplyResult::Allowed(req)
+            MiddlewareApplyResult::Allowed(req, outcome.credential_provenance)
         } else {
             MiddlewareApplyResult::Denied {
                 denial: outcome.denial,
@@ -998,7 +1001,10 @@ async fn apply_protocol1_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Se
         &outcome.body,
         &outcome.header_mutations,
     )?;
-    Ok(MiddlewareApplyResult::Allowed(rebuilt))
+    Ok(MiddlewareApplyResult::Allowed(
+        rebuilt,
+        outcome.credential_provenance,
+    ))
 }
 
 /// Run an HTTP hook request chain on the stage pipeline.
@@ -1056,7 +1062,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
         let rebuilt =
             crate::l7::rest::rebuild_request_headers_only(&req, &preflight.header_mutations)?;
         events.emit(true, "", None, HttpStageDiagnostics::default());
-        return Ok(MiddlewareApplyResult::Allowed(rebuilt));
+        return Ok(MiddlewareApplyResult::Allowed(rebuilt, Vec::new()));
     };
 
     let (prepared_headers, mut reader) =
@@ -1146,7 +1152,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
         &header_mutations,
     )?;
     events.emit(true, "", None, std::mem::take(&mut finish.diagnostics));
-    Ok(MiddlewareApplyResult::Allowed(rebuilt))
+    Ok(MiddlewareApplyResult::Allowed(rebuilt, Vec::new()))
 }
 
 /// Request head and framing shown to request middleware.
@@ -1544,6 +1550,7 @@ pub(super) fn request_middleware_events(
             reason: reason.to_string(),
             body: Vec::new(),
             header_mutations: Vec::new(),
+            credential_provenance: Vec::new(),
             findings: diagnostics.findings.clone(),
             metadata: diagnostics.metadata.clone(),
             applied,
@@ -1799,7 +1806,7 @@ pub(super) fn resolve_unbuffered_body(
         .all(|entry| entry.on_error() == openshell_supervisor_middleware::OnError::FailOpen);
     if recoverable && all_fail_open {
         emit_middleware_body_unavailable(ctx, false);
-        return MiddlewareApplyResult::Allowed(req);
+        return MiddlewareApplyResult::Allowed(req, Vec::new());
     }
     emit_middleware_body_unavailable(ctx, true);
     MiddlewareApplyResult::Denied {
@@ -2185,7 +2192,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(allowed, super::MiddlewareApplyResult::Allowed(_)));
+        assert!(matches!(allowed, super::MiddlewareApplyResult::Allowed(..)));
 
         // The caller injects a token grant under a custom header name before
         // it builds the response relay.
