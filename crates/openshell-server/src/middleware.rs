@@ -233,6 +233,48 @@ mod tests {
 
     #[cfg(feature = "mandatory-static-auth")]
     #[tokio::test]
+    async fn mandatory_auth_admits_endpoint_rules_without_runtime_credentials() {
+        let registry = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut policy = openshell_policy::parse_sandbox_policy(r"
+version: 1
+network_middlewares:
+  mandatory:
+    middleware: acme/myservice-auth
+    order: 2147483647
+    on_error: fail_closed
+    endpoints:
+      include: [api.service-1.com, api.service-2.com]
+    config:
+      rules:
+        - {host: api.service-1.com, port: 443, path: '/**', credential_env: SERVICE_1_TOKEN, header_name: X-MyService-ID}
+        - {host: api.service-2.com, port: 443, path: '/**', credential_env: SERVICE_2_TOKEN, header_name: X-MyService2-ID}
+").unwrap();
+        validate_policy(&registry, &policy).await.unwrap();
+        policy
+            .network_middlewares
+            .get_mut("mandatory")
+            .unwrap()
+            .endpoints
+            .as_mut()
+            .unwrap()
+            .include
+            .pop();
+        assert_eq!(
+            validate_policy(&registry, &policy)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[cfg(feature = "mandatory-static-auth")]
+    #[tokio::test]
     async fn mandatory_auth_validates_configuration_without_runtime_credentials() {
         let registry = MiddlewareRegistry::connect_services(
             openshell_supervisor_middleware_builtins::services(),

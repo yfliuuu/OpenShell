@@ -19,6 +19,55 @@ use crate::proto::{
 };
 use crate::provider_credentials::CredentialProvenance;
 
+/// Whether a header name consists of one nonempty HTTP token.
+#[must_use]
+pub fn is_valid_http_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Whether request middleware must not write or remove this header.
+#[must_use]
+pub fn is_protected_request_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "proxy-authenticate"
+            | "cookie"
+            | "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-connection"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "upgrade"
+    ) || name.starts_with("x-amz-")
+        || name.starts_with("x-openshell-credential")
+}
+
 /// Local-only evaluation data; credential provenance never crosses gRPC.
 pub struct LocalHttpRequestResult {
     pub result: HttpRequestResult,
@@ -477,6 +526,26 @@ pub fn middleware_timeout_or_default(value: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_header_checks_match_middleware_authority() {
+        for name in ["X-MyService-ID", "x-myservice2-id", "X-Token_2"] {
+            assert!(is_valid_http_header_name(name));
+            assert!(!is_protected_request_header(name));
+        }
+        for name in ["", "X Token", "X:Token", "X\r\nToken", "X-\u{e9}"] {
+            assert!(!is_valid_http_header_name(name));
+        }
+        for name in [
+            "AUTHORIZATION",
+            "Cookie",
+            "Connection",
+            "X-Amz-Date",
+            "X-OpenShell-Credential-ID",
+        ] {
+            assert!(is_protected_request_header(name));
+        }
+    }
 
     #[test]
     fn timeout_parser_matches_gateway_interceptor_duration_syntax() {
