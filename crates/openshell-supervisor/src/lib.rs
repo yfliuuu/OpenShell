@@ -1256,7 +1256,7 @@ pub async fn run_sandbox_with_backend(
             .unwrap_or(10);
         let poll_ctx = PolicyPollLoopContext {
             endpoint: poll_endpoint,
-            sandbox_id: poll_id,
+            sandbox_id: poll_id.clone(),
             sandbox: poll_sandbox,
             opa_engine: poll_engine,
             loaded_policy_origin,
@@ -1265,7 +1265,7 @@ pub async fn run_sandbox_with_backend(
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
             ocsf_schema_version: poll_ocsf_schema_version,
-            provider_credentials: poll_provider_credentials,
+            provider_credentials: poll_provider_credentials.clone(),
             provider_readiness: provider_readiness.clone(),
             policy_local_ctx: poll_policy_local,
             agent_proposals: agent_proposals.clone(),
@@ -1273,7 +1273,10 @@ pub async fn run_sandbox_with_backend(
             workspace_tx,
             extension_credentials: extension_credentials.clone(),
             extension_authentication_enabled: initial_extension_authentication_enabled,
-            middleware_connector: default_middleware_connector(),
+            middleware_connector: middleware_connector_for_sandbox(
+                poll_id,
+                poll_provider_credentials,
+            ),
             config_apply_rx: config_apply_rx.take(),
             config_push_enabled: Some(config_push_enabled),
             endpoint_observation_tx,
@@ -2367,6 +2370,12 @@ async fn load_policy_with_gateway(
             ))
             .build());
         let validate_middleware_config = |implementation: &str, config: &prost_types::Struct| {
+            if implementation == openshell_supervisor_middleware_builtins::mandatory_auth::NAME {
+                return Err(
+                    "mandatory authentication requires gateway-managed sandbox configuration"
+                        .to_string(),
+                );
+            }
             openshell_supervisor_middleware_builtins::validate_config(implementation, config)
                 .map_err(|error| error.to_string())
         };
@@ -2681,7 +2690,11 @@ async fn load_policy_with_gateway(
             // Install the in-process catalog before any external connection can
             // fail. A newly started sandbox must always be able to resolve built-in
             // bindings, even while operator-run services are unavailable.
-            install_builtin_middleware_registry(&engine).await?;
+            let startup_connector =
+                middleware_connector_for_sandbox(id.clone(), captured_provider_credentials.clone());
+            engine.replace_middleware_registry(
+                startup_connector(Vec::new(), MiddlewareAuthentication::default()).await?,
+            )?;
 
             // Connect operator-registered middleware services. A connect/describe
             // failure keeps the built-in registry active so each request's
@@ -2694,6 +2707,7 @@ async fn load_policy_with_gateway(
             let middleware_services = middleware_services.clone();
             let extension_credentials = extension_credentials.clone();
             let extension_authentication_enabled = snapshot.extension_authentication_enabled;
+            let startup_connector = startup_connector.clone();
             async move {
                 let credentials = if extension_authentication_enabled {
                     // Share the supervisor's store so the slots installed here
@@ -2708,9 +2722,9 @@ async fn load_policy_with_gateway(
                 } else {
                     std::collections::HashMap::new()
                 };
-                connect_middleware_registry(
-                    &middleware_services,
-                    &MiddlewareAuthentication {
+                startup_connector(
+                    middleware_services,
+                    MiddlewareAuthentication {
                         credentials,
                         enabled: extension_authentication_enabled,
                     },
@@ -2856,7 +2870,22 @@ fn prepare_startup_configuration(
     let engine = OpaEngine::from_proto(policy)?;
     let process_policy = SandboxPolicy::try_from(policy.clone())?;
     let credentials = prepare_provider_environment(provider)?;
+    validate_mandatory_auth_configuration(policy, &credentials)?;
     Ok((engine, process_policy, credentials))
+}
+
+fn validate_mandatory_auth_configuration(
+    policy: &openshell_core::proto::SandboxPolicy,
+    credentials: &ProviderCredentialState,
+) -> Result<()> {
+    #[cfg(feature = "mandatory-static-auth")]
+    openshell_supervisor_middleware_builtins::mandatory_auth::validate_policy(
+        policy,
+        &credentials.snapshot().dynamic_credentials,
+    )?;
+    #[cfg(not(feature = "mandatory-static-auth"))]
+    let _ = (policy, credentials);
+    Ok(())
 }
 
 /// Whether the provider response contains a complete environment snapshot that
@@ -3808,32 +3837,63 @@ struct MiddlewareAuthentication {
     enabled: bool,
 }
 
+#[cfg(test)]
 fn default_middleware_connector() -> MiddlewareConnector {
     Arc::new(|services, authentication| {
         Box::pin(async move { connect_middleware_registry(&services, &authentication).await })
     })
 }
 
+fn middleware_connector_for_sandbox(
+    sandbox_id: String,
+    credentials: ProviderCredentialState,
+) -> MiddlewareConnector {
+    Arc::new(move |services, authentication| {
+        let builtins = openshell_supervisor_middleware_builtins::services_for_sandbox(
+            &sandbox_id,
+            credentials.clone(),
+        );
+        Box::pin(async move {
+            connect_middleware_registry_with_builtins(&services, &authentication, builtins?).await
+        })
+    })
+}
+
+#[cfg(test)]
 async fn connect_middleware_registry(
     services: &[openshell_core::proto::SupervisorMiddlewareService],
     authentication: &MiddlewareAuthentication,
 ) -> Result<openshell_supervisor_middleware::MiddlewareRegistry> {
+    connect_middleware_registry_with_builtins(
+        services,
+        authentication,
+        openshell_supervisor_middleware_builtins::services(),
+    )
+    .await
+}
+
+async fn connect_middleware_registry_with_builtins(
+    services: &[openshell_core::proto::SupervisorMiddlewareService],
+    authentication: &MiddlewareAuthentication,
+    builtins: Vec<Arc<dyn openshell_core::middleware::InProcessMiddleware>>,
+) -> Result<openshell_supervisor_middleware::MiddlewareRegistry> {
     if authentication.enabled {
         openshell_supervisor_middleware::MiddlewareRegistry::connect_services_authenticated(
-            openshell_supervisor_middleware_builtins::services(),
+            builtins,
             services.to_vec(),
             &authentication.credentials,
         )
         .await
     } else {
         openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
-            openshell_supervisor_middleware_builtins::services(),
+            builtins,
             services.to_vec(),
         )
         .await
     }
 }
 
+#[cfg(test)]
 async fn install_builtin_middleware_registry(opa_engine: &OpaEngine) -> Result<()> {
     let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
         openshell_supervisor_middleware_builtins::services(),
@@ -4571,6 +4631,26 @@ filesystem_policy:
 
     pub fn proto_policy_fixture() -> openshell_core::proto::SandboxPolicy {
         openshell_policy::restrictive_default_policy()
+    }
+
+    #[cfg(feature = "mandatory-static-auth")]
+    pub fn mandatory_auth_policy_fixture() -> openshell_core::proto::SandboxPolicy {
+        openshell_policy::parse_sandbox_policy(
+            r#"
+version: 1
+network_middlewares:
+  mandatory:
+    middleware: acme/myservice-auth
+    order: 2147483647
+    on_error: fail_closed
+    endpoints:
+      include: [tools.example.com]
+    config:
+      credential_env: EXTERNAL_TOKEN
+      header_name: X-MyService-ID
+"#,
+        )
+        .unwrap()
     }
 
     pub fn proto_tcp_policy_fixture() -> openshell_core::proto::SandboxPolicy {

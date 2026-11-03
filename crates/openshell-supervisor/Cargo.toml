@@ -49,6 +49,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [features]
+mandatory-static-auth = ["openshell-supervisor-middleware-builtins/mandatory-static-auth"]
 default = ["telemetry", "bundled-ca-roots"]
 system-ca-roots = ["telemetry"]
 defaults-without-telemetry = ["bundled-ca-roots"]

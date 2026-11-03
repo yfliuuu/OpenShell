@@ -22,7 +22,33 @@ pub use regex::{NAME as BUILTIN_REGEX, RegexConfig, RegexMode};
 
 /// Return the first-party services that the gateway and supervisor install.
 pub fn services() -> Vec<Arc<dyn InProcessMiddleware>> {
+    #[cfg(feature = "mandatory-static-auth")]
+    return vec![
+        Arc::new(BuiltinMiddlewareService),
+        Arc::new(mandatory_auth::MandatoryAuthService::validation_only()),
+    ];
+    #[cfg(not(feature = "mandatory-static-auth"))]
     vec![Arc::new(BuiltinMiddlewareService)]
+}
+
+/// Construct execution services bound to the supervisor's live sandbox state.
+pub fn services_for_sandbox(
+    sandbox_id: &str,
+    credentials: openshell_core::provider_credentials::ProviderCredentialState,
+) -> Result<Vec<Arc<dyn InProcessMiddleware>>> {
+    #[cfg(feature = "mandatory-static-auth")]
+    return Ok(vec![
+        Arc::new(BuiltinMiddlewareService),
+        Arc::new(mandatory_auth::MandatoryAuthService::for_sandbox(
+            sandbox_id.into(),
+            credentials,
+        )?),
+    ]);
+    #[cfg(not(feature = "mandatory-static-auth"))]
+    {
+        let _ = (sandbox_id, credentials);
+        Ok(services())
+    }
 }
 
 /// Resolve and validate a first-party config before the supervisor has selected
@@ -30,6 +56,8 @@ pub fn services() -> Vec<Arc<dyn InProcessMiddleware>> {
 pub fn validate_config(implementation: &str, config: &prost_types::Struct) -> Result<()> {
     match implementation {
         BUILTIN_REGEX => regex::validate_config(config),
+        #[cfg(feature = "mandatory-static-auth")]
+        mandatory_auth::NAME => mandatory_auth::AuthConfig::from_struct(config).map(|_| ()),
         other => Err(miette!(
             "middleware implementation '{other}' is not a registered OpenShell built-in"
         )),

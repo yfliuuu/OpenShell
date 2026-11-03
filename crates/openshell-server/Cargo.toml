@@ -118,6 +118,7 @@ arc-swap = "1"
 notify = "8"
 
 [features]
+mandatory-static-auth = ["openshell-supervisor-middleware-builtins/mandatory-static-auth"]
 default = ["telemetry"]
 ## Compile in anonymous telemetry emission (forwards to openshell-core/telemetry).
 ## On by default; build with `--no-default-features` for a telemetry-free gateway

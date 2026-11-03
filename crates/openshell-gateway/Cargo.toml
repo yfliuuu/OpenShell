@@ -40,6 +40,7 @@ tracing = { workspace = true, optional = true }
 openshell-driver-mxc = { path = "../openshell-driver-mxc", optional = true }
 
 [features]
+mandatory-static-auth = ["openshell-server/mandatory-static-auth"]
 default = ["telemetry", "in-tree-compute-drivers"]
 in-tree-compute-drivers = [
     "compute-driver-docker",
