@@ -16,6 +16,32 @@ use crate::proto::{
     SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
     WebSocketSessionEvent, WebSocketSessionEventResult,
 };
+use crate::provider_credentials::CredentialProvenance;
+
+/// Local-only evaluation data; credential provenance never crosses gRPC.
+pub struct LocalHttpRequestResult {
+    pub result: HttpRequestResult,
+    pub credential_provenance: Option<CredentialProvenance>,
+}
+
+impl From<HttpRequestResult> for LocalHttpRequestResult {
+    fn from(result: HttpRequestResult) -> Self {
+        Self {
+            result,
+            credential_provenance: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for LocalHttpRequestResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalHttpRequestResult")
+            .field("decision", &self.result.decision)
+            .field("credential_provenance", &self.credential_provenance)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Transport-neutral result stream for one HTTP response middleware stage.
 pub type HttpResponseResultStream = Pin<
@@ -229,6 +255,11 @@ impl<'a> HttpRequestView<'a> {
 /// ```
 #[async_trait::async_trait]
 pub trait InProcessMiddleware: Send + Sync {
+    /// Require a dispatch pin on every successful authentication result.
+    fn requires_credential_provenance(&self) -> bool {
+        false
+    }
+
     /// Return the immutable manifest describing this implementation.
     async fn describe(&self) -> MiddlewareManifest;
 
@@ -254,6 +285,14 @@ pub trait InProcessMiddleware: Send + Sync {
         &self,
         request: HttpRequestView<'_>,
     ) -> Result<HttpRequestResult>;
+
+    /// Evaluate locally without adding credential state to the wire protocol.
+    async fn evaluate_http_request_local(
+        &self,
+        request: HttpRequestView<'_>,
+    ) -> Result<LocalHttpRequestResult> {
+        self.evaluate_http_request(request).await.map(Into::into)
+    }
 
     /// Open one persistent WebSocket middleware session.
     ///
