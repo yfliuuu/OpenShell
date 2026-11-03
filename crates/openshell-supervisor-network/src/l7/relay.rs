@@ -8079,6 +8079,7 @@ network_policies:
             // serialize it.
             body: format!(r#"{{"api_key":"{RAW_SECRET}"}}"#).into_bytes(),
             header_mutations: Vec::new(),
+            credential_provenance: Vec::new(),
             findings: vec![NamespacedFinding {
                 middleware: "regex-redactor".into(),
                 finding: openshell_core::proto::Finding {
@@ -8170,6 +8171,7 @@ network_policies:
             reason: "middleware_denied:content-guard:content_match".into(),
             body: Vec::new(),
             header_mutations: Vec::new(),
+            credential_provenance: Vec::new(),
             findings: Vec::new(),
             metadata: BTreeMap::new(),
             applied: vec![MiddlewareInvocation {

@@ -61,8 +61,8 @@ use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
 use binding_policy::BindingPolicy;
 pub use openshell_core::middleware::{
     HttpRequestHookResultStream, HttpRequestView, HttpResponseHookResultStream,
-    HttpResponseResultStream, InProcessMiddleware, SupervisorMiddlewareEndpoint,
-    WebSocketResponseStream,
+    HttpResponseResultStream, InProcessMiddleware, LocalHttpRequestResult,
+    SupervisorMiddlewareEndpoint, WebSocketResponseStream,
 };
 
 pub type MiddlewareService =
@@ -677,13 +677,15 @@ pub struct HttpRequestInput {
     pub body: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChainOutcome {
     pub allowed: bool,
     pub reason: String,
     pub body: Vec<u8>,
     /// Ordered, validated mutations to replay against the original raw request.
     pub header_mutations: Vec<HeaderMutation>,
+    /// Dispatch pins produced only by trusted local middleware.
+    pub credential_provenance: Vec<openshell_core::provider_credentials::CredentialProvenance>,
     pub findings: Vec<NamespacedFinding>,
     pub metadata: BTreeMap<String, BTreeMap<String, String>>,
     pub applied: Vec<MiddlewareInvocation>,
@@ -691,6 +693,19 @@ pub struct ChainOutcome {
     /// denied the request. Fail-closed service errors and transformed-body
     /// policy denials are not represented as middleware decisions.
     pub denial: Option<MiddlewareDenial>,
+}
+
+impl std::fmt::Debug for ChainOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChainOutcome")
+            .field("allowed", &self.allowed)
+            .field("body_bytes", &self.body.len())
+            .field("header_mutations", &self.header_mutations.len())
+            .field("credential_provenance", &self.credential_provenance)
+            .field("denial", &self.denial)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -818,15 +833,24 @@ impl MiddlewareDispatch {
     async fn evaluate_http_request(
         &self,
         request: HttpRequestView<'_>,
-    ) -> std::result::Result<tonic::Response<openshell_core::proto::HttpRequestResult>, tonic::Status>
-    {
+    ) -> std::result::Result<tonic::Response<LocalHttpRequestResult>, tonic::Status> {
         match self {
             Self::InProcess(service) => service
-                .evaluate_http_request(request)
+                .evaluate_http_request_local(request)
                 .await
                 .map(tonic::Response::new)
                 .map_err(|error| tonic::Status::invalid_argument(error.to_string())),
-            Self::Grpc(service) => service.evaluate_http_request(request).await,
+            Self::Grpc(service) => service
+                .evaluate_http_request(request)
+                .await
+                .map(|response| tonic::Response::new(response.into_inner().into())),
+        }
+    }
+
+    fn requires_credential_provenance(&self) -> bool {
+        match self {
+            Self::InProcess(service) => service.requires_credential_provenance(),
+            Self::Grpc(_) => false,
         }
     }
 
@@ -2119,6 +2143,7 @@ impl ChainRunner {
                 reason: format!("middleware_failed: {MIDDLEWARE_HOOK_VERSIONS_MIXED}"),
                 body: input.body,
                 header_mutations: Vec::new(),
+                credential_provenance: Vec::new(),
                 findings: Vec::new(),
                 metadata: BTreeMap::new(),
                 applied: vec![MiddlewareInvocation {
@@ -2172,6 +2197,9 @@ impl ChainRunner {
             .collect();
         let mut body = body;
         let mut header_mutations = Vec::new();
+        let mut credential_provenance: Vec<
+            openshell_core::provider_credentials::CredentialProvenance,
+        > = Vec::new();
         let mut findings = Vec::new();
         let mut metadata = BTreeMap::new();
         let mut applied = Vec::new();
@@ -2188,6 +2216,7 @@ impl ChainRunner {
                             reason,
                             body,
                             header_mutations,
+                            credential_provenance,
                             findings,
                             metadata,
                             applied,
@@ -2205,6 +2234,7 @@ impl ChainRunner {
                             reason,
                             body,
                             header_mutations,
+                            credential_provenance,
                             findings,
                             metadata,
                             applied,
@@ -2231,6 +2261,7 @@ impl ChainRunner {
                             reason,
                             body,
                             header_mutations,
+                            credential_provenance,
                             findings,
                             metadata,
                             applied,
@@ -2252,6 +2283,7 @@ impl ChainRunner {
                             reason,
                             body,
                             header_mutations,
+                            credential_provenance,
                             findings,
                             metadata,
                             applied,
@@ -2260,7 +2292,7 @@ impl ChainRunner {
                     }
                 }
             }
-            let mut result = match call_with_timeout(
+            let local_result = match call_with_timeout(
                 entry.timeout.min(remaining),
                 "EvaluateHttpRequest",
                 service.service.evaluate_http_request(request),
@@ -2282,6 +2314,7 @@ impl ChainRunner {
                                 reason,
                                 body,
                                 header_mutations,
+                                credential_provenance,
                                 findings,
                                 metadata,
                                 applied,
@@ -2292,6 +2325,10 @@ impl ChainRunner {
                 }
             };
 
+            let LocalHttpRequestResult {
+                mut result,
+                credential_provenance: stage_provenance,
+            } = local_result;
             if let Err(reason) = validate_response_envelope(&result) {
                 match apply_on_error(entry, reason, &mut applied) {
                     OnErrorAction::FailOpen => continue,
@@ -2301,6 +2338,7 @@ impl ChainRunner {
                             reason,
                             body,
                             header_mutations,
+                            credential_provenance,
                             findings,
                             metadata,
                             applied,
@@ -2325,6 +2363,7 @@ impl ChainRunner {
                                 reason,
                                 body,
                                 header_mutations,
+                                credential_provenance,
                                 findings,
                                 metadata,
                                 applied,
@@ -2369,11 +2408,28 @@ impl ChainRunner {
                     ),
                     body,
                     header_mutations,
+                    credential_provenance,
                     findings,
                     metadata,
                     applied,
                     denial: Some(denial),
                 });
+            }
+
+            if service.service.requires_credential_provenance() && stage_provenance.is_none() {
+                return Err(miette!(
+                    "mandatory middleware omitted credential provenance"
+                ));
+            }
+            if let Some(pin) = &stage_provenance
+                && credential_provenance.first().is_some_and(|previous| {
+                    previous.revision() != pin.revision()
+                        || previous.installation_id() != pin.installation_id()
+                })
+            {
+                return Err(miette!(
+                    "middleware combined different credential installations"
+                ));
             }
 
             if result.has_body && result.body.len() > entry.max_payload_bytes {
@@ -2385,6 +2441,7 @@ impl ChainRunner {
                             reason,
                             body,
                             header_mutations,
+                            credential_provenance,
                             findings,
                             metadata,
                             applied,
@@ -2419,6 +2476,7 @@ impl ChainRunner {
                                     reason,
                                     body,
                                     header_mutations,
+                                    credential_provenance,
                                     findings,
                                     metadata,
                                     applied,
@@ -2436,6 +2494,9 @@ impl ChainRunner {
                 headers = updated;
             }
             header_mutations.extend(std::mem::take(&mut result.header_mutations));
+            if let Some(pin) = stage_provenance {
+                credential_provenance.push(pin);
+            }
 
             let body_transformed = result.has_body;
             if body_transformed {
@@ -2481,6 +2542,7 @@ impl ChainRunner {
                         reason,
                         body,
                         header_mutations,
+                        credential_provenance,
                         findings,
                         metadata,
                         applied,
@@ -2495,6 +2557,7 @@ impl ChainRunner {
             reason: String::new(),
             body,
             header_mutations,
+            credential_provenance,
             findings,
             metadata,
             applied,
@@ -2835,6 +2898,7 @@ mod tests {
         let received = service.received.lock().expect("borrowed requests");
 
         assert!(outcome.allowed);
+        assert!(outcome.credential_provenance.is_empty());
         assert_eq!(outcome.body.as_ptr().addr(), expected_body);
         assert_eq!(received.len(), 2);
         assert_eq!(received[0].phase, SupervisorMiddlewarePhase::PreCredentials);
@@ -2853,6 +2917,148 @@ mod tests {
             received
                 .iter()
                 .all(|request| request.middleware_name == "acme/redactor")
+        );
+    }
+
+    struct PinnedService {
+        name: String,
+        pin: Option<openshell_core::provider_credentials::CredentialProvenance>,
+    }
+
+    #[tonic::async_trait]
+    impl InProcessMiddleware for PinnedService {
+        fn requires_credential_provenance(&self) -> bool {
+            true
+        }
+
+        async fn describe(&self) -> MiddlewareManifest {
+            BorrowedRecordingService {
+                manifest_name: self.name.clone(),
+                received: std::sync::Mutex::new(Vec::new()),
+                advertise_protocol: true,
+            }
+            .describe()
+            .await
+        }
+
+        async fn validate_config(&self, _: &str, _: &prost_types::Struct) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _: HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            Ok(allow_result())
+        }
+
+        async fn evaluate_http_request_local(
+            &self,
+            request: HttpRequestView<'_>,
+        ) -> Result<LocalHttpRequestResult> {
+            let mut result = self.evaluate_http_request(request).await?;
+            result.header_mutations.push(write_header(
+                "x-test-auth",
+                "synthetic-secret",
+                ExistingHeaderAction::Overwrite,
+            ));
+            Ok(LocalHttpRequestResult {
+                result,
+                credential_provenance: self.pin.clone(),
+            })
+        }
+    }
+
+    fn test_credential_pin() -> openshell_core::provider_credentials::CredentialProvenance {
+        let state =
+            openshell_core::provider_credentials::ProviderCredentialState::from_bound_environment(
+                7,
+                HashMap::from([("API_KEY".into(), "synthetic-secret".into())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([(
+                    "API_KEY".into(),
+                    openshell_core::proto::StaticCredentialBinding {
+                        credential_identity: "provider:API_KEY".into(),
+                        endpoints: vec![openshell_core::proto::StaticCredentialEndpointBinding {
+                            host: "api.example.com".into(),
+                            port: 443,
+                            path: "/**".into(),
+                        }],
+                        ..Default::default()
+                    },
+                )]),
+                Vec::new(),
+            )
+            .unwrap();
+        state
+            .resolve_static_credential("API_KEY", "api.example.com", 443, "/")
+            .unwrap()
+            .provenance()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn local_credential_provenance_is_carried_and_debug_redacted() {
+        let pin = test_credential_pin();
+        let runner = ChainRunner::new(Arc::new(PinnedService {
+            name: BUILTIN_REGEX.into(),
+            pin: Some(pin.clone()),
+        }));
+        let outcome = runner
+            .evaluate(&[entry("pinned", OnError::FailClosed)], input("body"))
+            .await
+            .unwrap();
+        assert!(outcome.allowed);
+        assert_eq!(outcome.credential_provenance, vec![pin]);
+        assert!(!format!("{outcome:?}").contains("synthetic-secret"));
+    }
+
+    #[tokio::test]
+    async fn required_credential_provenance_cannot_fail_open() {
+        let runner = ChainRunner::new(Arc::new(PinnedService {
+            name: BUILTIN_REGEX.into(),
+            pin: None,
+        }));
+        let error = runner
+            .evaluate(&[entry("pinned", OnError::FailOpen)], input("body"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("omitted credential provenance"));
+    }
+
+    #[tokio::test]
+    async fn local_credential_provenance_rejects_mixed_installations() {
+        let registry = MiddlewareRegistry::connect_services(
+            vec![
+                Arc::new(PinnedService {
+                    name: "test/first".into(),
+                    pin: Some(test_credential_pin()),
+                }),
+                Arc::new(PinnedService {
+                    name: "test/second".into(),
+                    pin: Some(test_credential_pin()),
+                }),
+            ],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let runner = ChainRunner::from_registry(registry);
+        let mut first = entry("first", OnError::FailClosed);
+        first.implementation = "test/first".into();
+        let mut second = first.clone();
+        second.name = "second".into();
+        second.implementation = "test/second".into();
+        second.order = 1;
+        let error = runner
+            .evaluate(&[first, second], input("body"))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("different credential installations")
         );
     }
 
