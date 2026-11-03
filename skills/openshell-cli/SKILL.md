@@ -635,9 +635,10 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 Middleware can inspect HTTP requests, HTTP responses, or client WebSocket text
 messages when the implementation advertises the matching binding. The built-in
 `openshell/regex` supports request bodies and client WebSocket text messages.
-`acme/myservice-auth` is available only in custom gateway and supervisor builds
-with mandatory static authentication enabled. It is in-process, not an external
-registration. Follow the [custom-build configuration requirements](https://docs.nvidia.com/openshell/latest/extensibility/supervisor-middleware/configure.md#mandatory-static-authentication-in-custom-builds)
+`acme/myservice-auth` is available in default gateway and supervisor builds.
+It is in-process, not an external registration; a policy attachment activates
+enforcement. Confirm availability for older releases or builds that disable
+default features. Follow the [mandatory authentication configuration requirements](https://docs.nvidia.com/openshell/latest/extensibility/supervisor-middleware/configure.md#mandatory-static-authentication)
 before selecting it. For multiple providers, configure endpoint rules in one
 maximum-order attachment, with distinct credential keys and per-rule custom
 headers. Unmatched selected traffic fails closed; protected headers remain

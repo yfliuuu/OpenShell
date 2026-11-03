@@ -185,9 +185,9 @@ A denial from middleware always blocks traffic, regardless of `on_error`. Middle
 
 `on_error` does not extend what middleware can inspect. The [current limitations](/extensibility/supervisor-middleware#current-limitations) apply under both settings. With the default behavior, an entry cannot select a `tls: skip` endpoint, because OpenShell cannot inspect that traffic.
 
-## Mandatory Static Authentication in Custom Builds
+## Mandatory Static Authentication
 
-Custom gateway and supervisor binaries built with the `mandatory-static-auth` feature provide `acme/myservice-auth` as in-process middleware. Default builds do not register it. It requires gateway-managed sandbox configuration and no external middleware service.
+Default gateway and supervisor builds enable the `mandatory-static-auth` Cargo feature and register `acme/myservice-auth` as in-process middleware. Enforcement remains opt-in through sandbox policy. It requires gateway-managed sandbox configuration and no external middleware service. Builds using `--no-default-features` must select `mandatory-static-auth` if they need this handler; the telemetry-free and supervisor system-CA build aliases retain it.
 
 Attach providers with distinct static credential keys and endpoint bindings, then add one independent mandatory attachment:
 
@@ -223,7 +223,7 @@ The maximum order makes this the last request middleware. Dynamic token grants t
 
 Keep the attachment outside provider-generated policy so detaching a provider cannot remove enforcement. After detachment or revocation activates, requests selecting that provider fail closed until an authorized replacement becomes available; other rules can continue using their own credentials. Rotation applies to subsequent requests on existing connections. Requests prepared with a replaced installation or an expired credential cannot dispatch.
 
-The request body limit is 256 KiB. Existing buffering and inspected HTTP protocol limitations still apply. The service must treat this header as authoritative and must not expose the credential in responses. Refer to the [custom-build implementation and verification guide](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-supervisor-middleware-builtins/README.md) for build instructions.
+The request body limit is 256 KiB. Existing buffering and inspected HTTP protocol limitations still apply. The service must treat this header as authoritative and must not expose the credential in responses. Refer to the [implementation and verification guide](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-supervisor-middleware-builtins/README.md) for build instructions.
 
 ## Operate Middleware Services
 

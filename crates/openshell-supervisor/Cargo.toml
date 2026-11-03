@@ -50,9 +50,9 @@ uuid = { workspace = true }
 
 [features]
 mandatory-static-auth = ["openshell-supervisor-middleware-builtins/mandatory-static-auth"]
-default = ["telemetry", "bundled-ca-roots"]
-system-ca-roots = ["telemetry"]
-defaults-without-telemetry = ["bundled-ca-roots"]
+default = ["telemetry", "bundled-ca-roots", "mandatory-static-auth"]
+system-ca-roots = ["telemetry", "mandatory-static-auth"]
+defaults-without-telemetry = ["bundled-ca-roots", "mandatory-static-auth"]
 telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
