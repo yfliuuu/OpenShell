@@ -175,10 +175,11 @@ where
         ));
     }
     let mut decision = EgressDecision {
-        intent: if tls {
-            EgressIntent::connect(network.host.clone(), network.port)
-        } else {
-            EgressIntent::forward_http(network.host.clone(), network.port)
+        intent: match mode {
+            HeldProxyMode::Connect => EgressIntent::connect(network.host.clone(), network.port),
+            HeldProxyMode::Forward => {
+                EgressIntent::forward_http(network.host.clone(), network.port)
+            }
         },
         action: authorization.action.clone(),
         policy_generation: authorization.generation,
@@ -280,10 +281,11 @@ where
         fence
             .check()
             .map_err(|reason| miette::miette!("held admission ended: {reason:?}"))?;
-        // Same validated native connector and optional corporate proxy path;
-        // no fallback, replay loop, or reuse of the pre-review upstream.
-        let stream: Box<dyn openshell_isolation_interface::contract::DuplexStream + '_> = if tls {
-            let upstream = dial_upstream(
+        // CONNECT keeps the native corporate proxy/NO_PROXY route even when
+        // its application stream is plaintext. FORWARD retains native direct
+        // dialing. TLS controls only the handshake, never routing or fallback.
+        let upstream = match mode {
+            HeldProxyMode::Connect => dial_upstream(
                 &environment.upstream_proxy,
                 &ctx.host,
                 &ctx.host,
@@ -291,7 +293,12 @@ where
                 connector.addrs(),
             )
             .await
-            .into_diagnostic()?;
+            .into_diagnostic()?,
+            HeldProxyMode::Forward => upstream_proxy::PrefixedStream::without_prefix(
+                connector.connect().await.into_diagnostic()?,
+            ),
+        };
+        let stream: Box<dyn openshell_isolation_interface::contract::DuplexStream + '_> = if tls {
             let state = environment
                 .tls_state
                 .as_ref()
@@ -301,7 +308,7 @@ where
                     .await?,
             )
         } else {
-            Box::new(connector.connect().await.into_diagnostic()?)
+            Box::new(upstream)
         };
         guard.ensure_current()?;
         environment.check_workspace(&workspace)?;

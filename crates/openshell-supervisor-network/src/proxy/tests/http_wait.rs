@@ -151,6 +151,59 @@ pub(super) fn held_proposal_context() -> Arc<PolicyLocalContext> {
 
 #[tokio::test]
 async fn explicit_and_virtual_connect_production_ingress_resume_once() {
+    held_connect_resume_case(HeldConnectRoute::Direct).await;
+}
+
+#[tokio::test]
+async fn plaintext_connect_resume_uses_upstream_proxy() {
+    held_connect_resume_case(HeldConnectRoute::Proxy).await;
+}
+
+#[tokio::test]
+async fn plaintext_connect_resume_honors_no_proxy() {
+    held_connect_resume_case(HeldConnectRoute::NoProxy).await;
+}
+
+#[tokio::test]
+async fn plaintext_connect_resume_proxy_rejection_never_falls_back() {
+    held_connect_resume_case(HeldConnectRoute::ProxyRejectsResume).await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HeldConnectRoute {
+    Direct,
+    Proxy,
+    NoProxy,
+    ProxyRejectsResume,
+}
+
+impl HeldConnectRoute {
+    fn proxied(self) -> bool {
+        matches!(self, Self::Proxy | Self::ProxyRejectsResume)
+    }
+}
+
+async fn answer_held_proxy_connect(stream: &mut TcpStream, destination: SocketAddr, reject: bool) {
+    let mut header = Vec::new();
+    while !header.ends_with(b"\r\n\r\n") {
+        header.push(stream.read_u8().await.unwrap());
+        assert!(header.len() < 8192);
+    }
+    assert_eq!(
+        header,
+        format!("CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\n\r\n").as_bytes(),
+        "corporate proxy must receive only CONNECT to the validated destination"
+    );
+    let response: &[u8] = if reject {
+        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"
+    } else {
+        b"HTTP/1.1 200 Connection Established\r\n\r\n"
+    };
+    stream.write_all(response).await.unwrap();
+    stream.flush().await.unwrap();
+}
+
+async fn held_connect_resume_case(route: HeldConnectRoute) {
     let Some(ip) = non_loopback_test_ipv4() else {
         eprintln!("skipping CONNECT wait fixture: no routable local test address");
         return;
@@ -159,6 +212,14 @@ async fn explicit_and_virtual_connect_production_ingress_resume_once() {
         for virtual_connect in [false, true] {
             let listener = TcpListener::bind((ip, 0)).await.unwrap();
             let destination = listener.local_addr().unwrap();
+            let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_proxy = UpstreamProxyConfig::from_args(&upstream_proxy::UpstreamProxyArgs {
+                https_proxy: (!matches!(route, HeldConnectRoute::Direct))
+                    .then(|| format!("http://{}", proxy_listener.local_addr().unwrap())),
+                no_proxy: matches!(route, HeldConnectRoute::NoProxy)
+                    .then(|| destination.to_string()),
+                ..Default::default()
+            }).unwrap();
             let data = policy_with_native_executable_paths(&format!(
                 "network_policies:\n  fixture:\n    endpoints:\n      - host: \"{ip}\"\n        port: {port}\n        protocol: rest\n        enforcement: enforce\n        allowed_ips: [\"{ip}/32\"]\n        rules:\n          - allow: {{method: GET, path: /allowed}}\n    binaries:\n      - path: /usr/bin/curl\n",
                 port = destination.port()
@@ -240,7 +301,7 @@ async fn explicit_and_virtual_connect_production_ingress_resume_once() {
                 AgentProposals::default(),
                 Arc::new(None),
                 Arc::new(None),
-                Arc::new(None),
+                Arc::new(upstream_proxy),
                 None,
                 None,
                 None,
@@ -252,10 +313,24 @@ async fn explicit_and_virtual_connect_production_ingress_resume_once() {
             assert!(poll!(handler.as_mut()).is_pending());
             // The handler must continue polling DNS/connect while the test
             // awaits accept; merely polling it once can strand that future.
+            let (expected, forbidden) = if route.proxied() {
+                (&proxy_listener, &listener)
+            } else {
+                (&listener, &proxy_listener)
+            };
             let (mut upstream, _) = tokio::select! {
-                accepted = listener.accept() => accepted.unwrap(),
+                accepted = expected.accept() => accepted.unwrap(),
+                _ = forbidden.accept() => panic!("initial CONNECT used wrong route: {route:?}"),
                 result = handler.as_mut() => panic!("CONNECT exited before upstream accept: {result:?}"),
             };
+            if route.proxied() {
+                let handshake = answer_held_proxy_connect(&mut upstream, destination, false);
+                tokio::pin!(handshake);
+                tokio::select! {
+                    () = handshake.as_mut() => {},
+                    result = handler.as_mut() => panic!("CONNECT exited during proxy handshake: {result:?}"),
+                }
+            }
             while engine.http_hitl_wait_runtime().population() == 0 {
                 assert!(poll!(handler.as_mut()).is_pending());
                 tokio::task::yield_now().await;
@@ -282,12 +357,14 @@ async fn explicit_and_virtual_connect_production_ingress_resume_once() {
             drive_held_until(handler.as_mut(), || recorder.observations.load(Ordering::Acquire) > observations).await;
             assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
             assert_no_held_dial(&listener).await;
+            assert_no_held_dial(&proxy_listener).await;
             recorder.decision.store(1, Ordering::Release);
             let observations = recorder.observations.load(Ordering::Acquire);
             engine.reload(include_str!("../../../data/sandbox-policy.rego"), &data).unwrap();
             drive_held_until(handler.as_mut(), || recorder.observations.load(Ordering::Acquire) > observations).await;
             assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
             assert_no_held_dial(&listener).await;
+            assert_no_held_dial(&proxy_listener).await;
             engine
                 .reload(
                     include_str!("../../../data/sandbox-policy.rego"),
@@ -295,42 +372,73 @@ async fn explicit_and_virtual_connect_production_ingress_resume_once() {
                 )
                 .unwrap();
             let server = async {
-                let (mut fresh, _) = listener.accept().await.unwrap();
-                serve_held_once(&mut fresh, destination, false).await;
+                let (mut fresh, _) = tokio::select! {
+                    accepted = expected.accept() => accepted.unwrap(),
+                    _ = forbidden.accept() => panic!("resumed CONNECT bypassed configured route: {route:?}"),
+                };
+                let reject = matches!(route, HeldConnectRoute::ProxyRejectsResume);
+                if route.proxied() {
+                    answer_held_proxy_connect(&mut fresh, destination, reject).await;
+                }
+                if reject {
+                    assert!(read_held_close(&mut fresh, false).await.is_empty(),
+                        "proxy rejection must not release HTTP bytes");
+                } else {
+                    serve_held_once(&mut fresh, destination, false).await;
+                }
             };
             let client = async {
-                assert_eq!(read_held_close(&mut wire, false).await, HELD_RESPONSE);
+                let response = read_held_close(&mut wire, false).await;
+                if matches!(route, HeldConnectRoute::ProxyRejectsResume) {
+                    assert!(response.is_empty(), "rejected proxy tunnel must retire the original client");
+                } else {
+                    assert_eq!(response, HELD_RESPONSE);
+                }
             };
             let (result, (), ()) = tokio::join!(handler, server, client);
+            // The native CONNECT adapter logs relay failures and returns Ok
+            // after retiring the client. Peer bytes and both backlogs below,
+            // not its return value, prove rejection without direct fallback.
             result.unwrap();
-            assert_no_held_dial(&listener).await;
+            for listener in [listener, proxy_listener] {
+                assert_eq!(listener.into_std().unwrap().accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock, "no extra dial or direct fallback");
+            }
             assert_eq!(recorder.metadata.lock().unwrap().len(), 1);
             assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
         }
     })
     .await
-    .expect("explicit/virtual CONNECT must resume exactly once and close");
+    .unwrap_or_else(|_| panic!("explicit/virtual CONNECT must resume exactly once and close: {route:?}"));
 }
 
 #[tokio::test]
 async fn forward_production_ingress_resume_once_without_early_dial() {
-    held_forward_resume_case("").await;
+    held_forward_resume_case("", false).await;
+}
+
+#[tokio::test]
+async fn forward_production_ingress_resume_keeps_native_direct_route() {
+    held_forward_resume_case("", true).await;
 }
 
 #[tokio::test]
 async fn forward_production_ingress_resume_strips_proxy_credentials() {
-    held_forward_resume_case(concat!(
-        "Proxy-Authorization: Basic proxy-auth-sentinel\r\n",
-        "pRoXy-AuThOrIzAtIoN: Basic repeated-proxy-auth-sentinel\r\n",
-        "Proxy-Connection: keep-alive\r\n",
-        "pRoXy-AuThEnTiCaTe: Basic realm=proxy-auth-sentinel\r\n",
-        "Connection: X-Proxy-Hop\r\n",
-        "X-Proxy-Hop: proxy-auth-sentinel\r\n",
-    ))
+    held_forward_resume_case(
+        concat!(
+            "Proxy-Authorization: Basic proxy-auth-sentinel\r\n",
+            "pRoXy-AuThOrIzAtIoN: Basic repeated-proxy-auth-sentinel\r\n",
+            "Proxy-Connection: keep-alive\r\n",
+            "pRoXy-AuThEnTiCaTe: Basic realm=proxy-auth-sentinel\r\n",
+            "Connection: X-Proxy-Hop\r\n",
+            "X-Proxy-Hop: proxy-auth-sentinel\r\n",
+        ),
+        false,
+    )
     .await;
 }
 
-async fn held_forward_resume_case(proxy_headers: &str) {
+async fn held_forward_resume_case(proxy_headers: &str, configure_proxy: bool) {
     let Some(ip) = non_loopback_test_ipv4() else {
         eprintln!("skipping FORWARD resume fixture: no routable local test address");
         return;
@@ -338,6 +446,12 @@ async fn held_forward_resume_case(proxy_headers: &str) {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let upstream = TcpListener::bind((ip, 0)).await.unwrap();
         let destination = upstream.local_addr().unwrap();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_proxy = UpstreamProxyConfig::from_args(&upstream_proxy::UpstreamProxyArgs {
+            https_proxy: configure_proxy
+                .then(|| format!("http://{}", proxy_listener.local_addr().unwrap())),
+            ..Default::default()
+        }).unwrap();
         let data = policy_with_native_executable_paths(&format!(
             "network_policies:\n  fixture:\n    endpoints:\n      - host: \"{ip}\"\n        port: {port}\n        protocol: rest\n        enforcement: enforce\n        allowed_ips: [\"{ip}/32\"]\n        rules:\n          - allow: {{method: GET, path: /allowed}}\n    binaries:\n      - path: /usr/bin/curl\n",
             port = destination.port()
@@ -376,7 +490,7 @@ async fn held_forward_resume_case(proxy_headers: &str) {
             AgentProposals::default(),
             Arc::new(None),
             Arc::new(None),
-            Arc::new(None),
+            Arc::new(upstream_proxy),
             None,
             None,
             None,
@@ -423,7 +537,10 @@ async fn held_forward_resume_case(proxy_headers: &str) {
         // Wake observation without relying on wall-clock polling latency.
         engine.reload(include_str!("../../../data/sandbox-policy.rego"), &data.replace("path: /allowed", "path: /missing")).unwrap();
         let server = async {
-            let (mut fresh, _) = upstream.accept().await.unwrap();
+            let (mut fresh, _) = tokio::select! {
+                accepted = upstream.accept() => accepted.unwrap(),
+                _ = proxy_listener.accept() => panic!("FORWARD must retain native direct routing"),
+            };
             serve_held_once(&mut fresh, destination, false).await;
         };
         let client = async {
@@ -432,6 +549,8 @@ async fn held_forward_resume_case(proxy_headers: &str) {
         let (result, (), ()) = tokio::join!(handler, server, client);
         result.unwrap();
         assert_no_held_dial(&upstream).await;
+        assert_eq!(proxy_listener.into_std().unwrap().accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock, "FORWARD must not dial the corporate CONNECT proxy");
         assert_eq!(recorder.metadata.lock().unwrap().len(), 1);
         assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
     })
