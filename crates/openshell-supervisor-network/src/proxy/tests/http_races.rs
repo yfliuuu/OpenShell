@@ -72,7 +72,7 @@ fn valid(e: &Evidence) -> bool {
     }
     if !e.wait_terminals.is_empty() {
         return e.wait_terminals.len() == 1
-            && e.wait_terminals[0].contains("terminal=ClientClosed;")
+            && e.wait_terminals[0] == "client_closed"
             && e.dials == 0
             && e.bytes == 0
             && e.readmissions == 0
@@ -140,7 +140,10 @@ async fn exchange(order: Order, round: usize, capture: &OcsfCapture) -> Evidence
     reviewer.pending.notified().await;
     assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
     let held = census();
-    assert!(held.tasks >= baseline.tasks + 1, "held tasks should include the pending session handler");
+    assert!(
+        held.tasks > baseline.tasks,
+        "held tasks should include the pending session handler"
+    );
     assert!(poll!(Box::pin(upstream.accept()).as_mut()).is_pending());
     let approve = || {
         reviewer.approved.store(true, Ordering::Release);
@@ -256,7 +259,7 @@ async fn exchange(order: Order, round: usize, capture: &OcsfCapture) -> Evidence
         readmissions: readmissions.len(),
         wait_terminals: terminal
             .iter()
-            .map(|e| e["message"].as_str().unwrap().to_owned())
+            .map(|e| e["unmapped"]["reason_code"].as_str().unwrap().to_owned())
             .collect(),
         exchanges: exchanges
             .iter()
@@ -372,6 +375,53 @@ fn fin_race_native_unordered_winners_match_actual_peer_bytes() {
         })
         .collect();
     run(&orders);
+}
+
+#[test]
+fn fin_race_evidence_requires_client_closed_reason_and_zero_release() {
+    let closed = Evidence {
+        dials: 0,
+        bytes: 0,
+        wait_terminals: vec!["client_closed".into()],
+        readmissions: 0,
+        exchanges: Vec::new(),
+    };
+    assert!(valid(&closed));
+
+    for reason in ["approval_timeout", "approval_rejected", "ClientClosed", ""] {
+        let invalid = Evidence {
+            wait_terminals: vec![reason.into()],
+            ..closed.clone()
+        };
+        assert!(!valid(&invalid), "unexpected terminal reason: {reason:?}");
+    }
+    for invalid in [
+        Evidence {
+            dials: 1,
+            ..closed.clone()
+        },
+        Evidence {
+            bytes: 1,
+            ..closed.clone()
+        },
+        Evidence {
+            readmissions: 1,
+            ..closed.clone()
+        },
+        Evidence {
+            exchanges: vec!["not_sent".into()],
+            ..closed.clone()
+        },
+        Evidence {
+            wait_terminals: vec!["client_closed".into(); 2],
+            ..closed
+        },
+    ] {
+        assert!(
+            !valid(&invalid),
+            "invalid cancellation evidence: {invalid:?}"
+        );
+    }
 }
 
 #[test]

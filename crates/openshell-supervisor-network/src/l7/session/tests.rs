@@ -12,7 +12,7 @@ use std::task::Poll;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const POLICY: &str = include_str!("../../../data/sandbox-policy.rego");
-const DATA: &str = r#"
+const DATA: &str = r"
 network_policies:
   fixture:
     endpoints:
@@ -24,7 +24,7 @@ network_policies:
           - allow: {method: GET, path: /allowed}
     binaries:
       - path: /usr/bin/curl
-"#;
+";
 const HEADER: &[u8] = b"GET /missing HTTP/1.1\r\nHost: api.example.test\r\n\r\n";
 
 fn engine() -> OpaEngine {
@@ -102,7 +102,7 @@ async fn wait_admission_takes_precedence_over_terminal_deny_logging() {
         .unwrap();
         assert!(!decision.0);
         assert_eq!(
-            slot.classification(&guard).unwrap().eligibility,
+            slot.classification(guard).unwrap().eligibility,
             RestHitlEligibility::EligibleForReview
         );
         assert!(crate::l7::relay::should_begin_wait_for_review(

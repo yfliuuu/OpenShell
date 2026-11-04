@@ -105,6 +105,7 @@ pub const HTTP_HITL_WAIT_TIMEOUT_SECONDS_KEY: &str = "http_hitl_wait_timeout_sec
 pub const HTTP_HITL_WAIT_SANDBOX_LIMIT_KEY: &str = "http_hitl_wait_sandbox_limit";
 
 /// Maximum number of active HTTP HITL waiters allowed for one destination bucket.
+///
 /// Values above 4 are rejected by the runtime; operators may tighten this below the
 /// current default while retaining the conservative per-destination charge.
 pub const HTTP_HITL_WAIT_DESTINATION_LIMIT_KEY: &str = "http_hitl_wait_destination_limit";

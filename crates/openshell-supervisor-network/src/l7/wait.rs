@@ -62,6 +62,8 @@ struct Population {
     destinations: HashMap<(String, u16), usize>,
 }
 
+// Test-only inspection; production observability uses reservation/session events.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WaitRuntimeSnapshot {
     pub enabled: bool,
@@ -92,7 +94,7 @@ pub struct WaitRuntime {
 
 impl Default for WaitRuntime {
     fn default() -> Self {
-        Self::with_limits(Duration::from_secs(300), 16, 4)
+        Self::with_limits(Duration::from_mins(5), 16, 4)
             .expect("fixed HTTP wait limits satisfy the safety caps")
     }
 }
@@ -100,7 +102,7 @@ impl Default for WaitRuntime {
 impl WaitRuntime {
     fn with_limits(budget: Duration, sandbox: usize, destination: usize) -> miette::Result<Self> {
         if budget.is_zero()
-            || budget > Duration::from_secs(300)
+            || budget > Duration::from_mins(5)
             || sandbox == 0
             || sandbox > 16
             || destination == 0
@@ -130,14 +132,17 @@ impl WaitRuntime {
         })
     }
 
+    #[cfg(test)]
     pub fn budget(&self) -> Duration {
         self.limits.lock().unwrap().budget
     }
 
+    #[cfg(test)]
     pub fn sandbox_limit(&self) -> usize {
         self.limits.lock().unwrap().sandbox_limit
     }
 
+    #[cfg(test)]
     pub fn destination_limit(&self) -> usize {
         self.limits.lock().unwrap().destination_limit
     }
@@ -149,7 +154,7 @@ impl WaitRuntime {
         destination: usize,
     ) -> miette::Result<()> {
         if budget.is_zero()
-            || budget > Duration::from_secs(300)
+            || budget > Duration::from_mins(5)
             || sandbox == 0
             || sandbox > 16
             || destination == 0
@@ -170,10 +175,14 @@ impl WaitRuntime {
             .is_ok_and(|state| state.enabled && !state.shutdown)
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn snapshot(&self) -> WaitRuntimeSnapshot {
         let limits = self.limits.lock().expect("HTTP wait limit lock poisoned");
-        let state = self.population.lock().expect("HTTP wait population lock poisoned");
+        let state = self
+            .population
+            .lock()
+            .expect("HTTP wait population lock poisoned");
         let mut destination_waiters = state
             .destinations
             .iter()
@@ -544,20 +553,32 @@ mod tests {
     #[test]
     fn default_runtime_uses_hard_caps_and_supports_tightening() {
         let runtime = WaitRuntime::default();
-        assert_eq!(runtime.budget(), Duration::from_secs(300));
+        assert_eq!(runtime.budget(), Duration::from_mins(5));
         assert_eq!(runtime.sandbox_limit(), 16);
         assert_eq!(runtime.destination_limit(), 4);
 
         runtime
-            .configure_limits(Duration::from_secs(120), 8, 2)
+            .configure_limits(Duration::from_mins(2), 8, 2)
             .expect("valid tightened limits should be accepted");
-        assert_eq!(runtime.budget(), Duration::from_secs(120));
+        assert_eq!(runtime.budget(), Duration::from_mins(2));
         assert_eq!(runtime.sandbox_limit(), 8);
         assert_eq!(runtime.destination_limit(), 2);
 
-        assert!(runtime.configure_limits(Duration::from_secs(301), 8, 2).is_err());
-        assert!(runtime.configure_limits(Duration::from_secs(120), 17, 2).is_err());
-        assert!(runtime.configure_limits(Duration::from_secs(120), 8, 5).is_err());
+        assert!(
+            runtime
+                .configure_limits(Duration::from_secs(301), 8, 2)
+                .is_err()
+        );
+        assert!(
+            runtime
+                .configure_limits(Duration::from_mins(2), 17, 2)
+                .is_err()
+        );
+        assert!(
+            runtime
+                .configure_limits(Duration::from_mins(2), 8, 5)
+                .is_err()
+        );
     }
 
     #[test]
@@ -583,7 +604,9 @@ mod tests {
     #[test]
     fn runtime_snapshot_reports_active_waits_and_terminal_reason_for_observability() {
         let runtime = runtime();
-        let charge = runtime.reserve("api.example.test", 80, Instant::now()).unwrap();
+        let charge = runtime
+            .reserve("api.example.test", 80, Instant::now())
+            .unwrap();
         let snapshot = runtime.snapshot();
         assert!(snapshot.enabled);
         assert_eq!(snapshot.total, 1);
@@ -591,10 +614,16 @@ mod tests {
         assert_eq!(snapshot.sandbox_limit, 16);
         assert_eq!(snapshot.destination_limit, 4);
         assert_eq!(snapshot.last_terminal_reason, Some("approval_disabled"));
-        assert_eq!(snapshot.destination_waiters, vec![("api.example.test".to_string(), 80, 1)]);
+        assert_eq!(
+            snapshot.destination_waiters,
+            vec![("api.example.test".to_string(), 80, 1)]
+        );
         drop(charge);
         assert_eq!(runtime.snapshot().total, 0);
-        assert_eq!(runtime.snapshot().destination_waiters, Vec::<(String, u16, usize)>::new());
+        assert_eq!(
+            runtime.snapshot().destination_waiters,
+            Vec::<(String, u16, usize)>::new()
+        );
 
         runtime.configure(false);
         let disabled = runtime.snapshot();
@@ -658,18 +687,18 @@ mod tests {
     fn concurrent_admission_never_overdraws_a_destination() {
         let runtime = runtime();
         let attempted = Arc::new(std::sync::Barrier::new(32));
-        let threads: Vec<_> = (0..32)
-            .map(|_| {
-                let runtime = runtime.clone();
-                let attempted = attempted.clone();
-                std::thread::spawn(move || {
-                    let charge = runtime.reserve("EXAMPLE.com.", 80, Instant::now());
-                    attempted.wait();
-                    assert!(runtime.population() <= 4);
-                    charge.is_some()
-                })
-            })
-            .collect();
+        let mut threads = Vec::with_capacity(32);
+        // Start every participant before joining: each thread waits on the barrier.
+        for _ in 0..32 {
+            let runtime = runtime.clone();
+            let attempted = attempted.clone();
+            threads.push(std::thread::spawn(move || {
+                let charge = runtime.reserve("EXAMPLE.com.", 80, Instant::now());
+                attempted.wait();
+                assert!(runtime.population() <= 4);
+                charge.is_some()
+            }));
+        }
         let admitted = threads
             .into_iter()
             .map(|thread| thread.join().unwrap())
@@ -683,9 +712,15 @@ mod tests {
     fn wait_end_exposes_stable_machine_readable_reasons() {
         assert_eq!(WaitEnd::Deadline.reason_code(), "approval_timeout");
         assert_eq!(WaitEnd::ProposalRejected.reason_code(), "approval_rejected");
-        assert_eq!(WaitEnd::ProposalUnavailable.reason_code(), "approval_unavailable");
+        assert_eq!(
+            WaitEnd::ProposalUnavailable.reason_code(),
+            "approval_unavailable"
+        );
         assert_eq!(WaitEnd::Disabled.reason_code(), "approval_disabled");
-        assert_eq!(WaitEnd::CurrentExecutorUnavailable.reason_code(), "current_executor_unavailable");
+        assert_eq!(
+            WaitEnd::CurrentExecutorUnavailable.reason_code(),
+            "current_executor_unavailable"
+        );
     }
 
     #[tokio::test(start_paused = true)]

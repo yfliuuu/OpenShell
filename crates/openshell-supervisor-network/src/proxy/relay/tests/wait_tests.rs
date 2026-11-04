@@ -7,7 +7,7 @@ use crate::l7::wait::WaitEnd;
 use futures::poll;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const DATA: &str = r#"
+const DATA: &str = r"
 network_policies:
   fixture:
     endpoints:
@@ -21,7 +21,7 @@ network_policies:
           - {method: GET, path: /denied}
     binaries:
       - path: /usr/bin/curl
-"#;
+";
 const HEADER: &[u8] = b"GET /missing HTTP/1.1\r\nHost: example.com\r\n\r\n";
 
 fn fixture() -> (OpaEngine, L7EvalContext) {

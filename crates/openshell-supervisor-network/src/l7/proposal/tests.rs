@@ -394,7 +394,7 @@ async fn http_hitl_disconnect_and_extra_input_cancel_stalled_submission() {
 
 fn provider_projection_fixture(credentialed: bool) -> SandboxPolicy {
     let mut policy = openshell_policy::parse_sandbox_policy(
-        r#"
+        r"
 version: 1
 network_policies:
   _provider_oc_company:
@@ -411,7 +411,7 @@ network_policies:
           - {method: DELETE, path: /v3/blocked}
     binaries:
       - {path: /usr/local/bin/node}
-"#,
+",
     )
     .unwrap();
     let rule = policy

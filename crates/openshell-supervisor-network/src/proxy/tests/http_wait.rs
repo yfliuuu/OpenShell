@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::l7::wait::WaitEnd;
 use futures::poll;
 
 // Every review in these ingress fixtures uses a simulated HeldProposalService;
@@ -543,8 +544,32 @@ async fn held_forward_terminal_case(end: HeldForwardEnd) {
         }
         let client = async { read_held_close(&mut wire, false).await };
         let (result, response) = tokio::join!(handler, client);
-        result.unwrap();
-        assert_no_held_dial(&listener).await;
+        match end {
+            HeldForwardEnd::DefaultOff => result.unwrap(),
+            HeldForwardEnd::Rejected | HeldForwardEnd::Disabled | HeldForwardEnd::ClientClosed => {
+                let expected_reason = match end {
+                    HeldForwardEnd::Rejected => WaitEnd::ProposalRejected,
+                    HeldForwardEnd::Disabled => WaitEnd::Disabled,
+                    HeldForwardEnd::ClientClosed => WaitEnd::ClientClosed,
+                    HeldForwardEnd::DefaultOff => unreachable!(),
+                };
+                // A held terminal is an explicit error, unlike the ordinary
+                // default-off denial. Do not accept unrelated handler failures.
+                let error = result.expect_err("terminal hold must not complete as a resumed request");
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "held review ended before fresh admission: reason={} ({expected_reason:?})",
+                        expected_reason.reason_code()
+                    ),
+                    "wrong terminal result for {end:?}"
+                );
+            }
+        }
+        // The handler has retired. Inspect the kernel backlog, not a possibly
+        // stale Tokio readiness cache, to prove no connection was attempted.
+        let listener = listener.into_std().unwrap();
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
         if matches!(end, HeldForwardEnd::DefaultOff) {
             assert!(response.starts_with(b"HTTP/1.1 403"));

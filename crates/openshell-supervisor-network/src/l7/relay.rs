@@ -13676,7 +13676,7 @@ network_policies:
                         drop(app.take());
                     }
 
-                    let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    let exchange = async {
                         if route_selected {
                             relay_with_route_selection(
                                 &[config],
@@ -13690,9 +13690,11 @@ network_policies:
                             relay_with_inspection(&config, engine, &mut client, &mut upstream, &ctx)
                                 .await
                         }
-                    })
-                    .await
-                    .expect("version policy must reject before upstream I/O");
+                    };
+                    let result =
+                        tokio::time::timeout(std::time::Duration::from_secs(1), Box::pin(exchange))
+                            .await
+                            .expect("version policy must reject before upstream I/O");
                     assert_eq!(result.is_err(), disconnect_client);
                     drop(client);
                     drop(upstream);

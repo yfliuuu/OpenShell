@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const POLICY: &str = include_str!("../../../data/sandbox-policy.rego");
-const DATA: &str = r#"
+const DATA: &str = r"
 network_policies:
   fixture:
     endpoints:
@@ -28,7 +28,7 @@ network_policies:
           - {method: GET, path: /query, query: {mode: {glob: forbidden}}}
     binaries:
       - {path: /usr/bin/curl}
-"#;
+";
 
 fn context() -> L7EvalContext {
     L7EvalContext {

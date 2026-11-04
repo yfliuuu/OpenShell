@@ -343,11 +343,17 @@ fn task_census_tracks_abort_without_leaving_detached_task_leaks() {
         let task = tokio::spawn(std::future::pending::<()>());
         tokio::task::yield_now().await;
         let spawned = census();
-        assert!(spawned.tasks >= baseline.tasks + 1, "spawned task should be visible in the task census");
+        assert!(
+            spawned.tasks > baseline.tasks,
+            "spawned task should be visible in the task census"
+        );
         assert_ne!(spawned, baseline);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         let after_abort = census();
-        assert!(after_abort.tasks <= baseline.tasks + 1, "task abort should leave a bounded task footprint");
+        assert!(
+            after_abort.tasks <= baseline.tasks + 1,
+            "task abort should leave a bounded task footprint"
+        );
     });
 }

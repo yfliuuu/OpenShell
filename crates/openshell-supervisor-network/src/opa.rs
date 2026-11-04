@@ -352,9 +352,9 @@ impl OpaEngine {
         sandbox_limit: usize,
         destination_limit: usize,
     ) {
-        if let Err(error) = self
-            .http_hitl_wait
-            .configure_limits(budget, sandbox_limit, destination_limit)
+        if let Err(error) =
+            self.http_hitl_wait
+                .configure_limits(budget, sandbox_limit, destination_limit)
         {
             warn!(
                 ?budget,
@@ -8929,7 +8929,7 @@ network_policies:
         let generation = engine
             .enter_fail_closed("candidate policy validation failed: conflicting tls")
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), stale)
+        tokio::time::timeout(Duration::from_secs(1), stale)
             .await
             .expect("generation waiter should wake");
         assert_eq!(generation, 1);

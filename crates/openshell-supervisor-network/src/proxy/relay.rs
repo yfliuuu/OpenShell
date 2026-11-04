@@ -576,7 +576,7 @@ mod tests {
         use futures::poll;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let exchange = async {
             let ca = SandboxCa::generate().unwrap();
             let mut roots = rustls::RootCertStore::empty();
             for certificate in rustls_pemfile::certs(&mut ca.cert_pem().as_bytes()) {
@@ -634,9 +634,10 @@ mod tests {
             session.terminate().await.unwrap();
             let mut remainder = Vec::new();
             wire.read_to_end(&mut remainder).await.unwrap();
-        })
-        .await
-        .expect("retaining the original TLS stream must not require another handshake");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), Box::pin(exchange))
+            .await
+            .expect("retaining the original TLS stream must not require another handshake");
     }
 
     #[tokio::test]
