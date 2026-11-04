@@ -414,6 +414,52 @@ async fn http_hitl_lost_reply_retry_survives_database_reopen() {
 }
 
 #[tokio::test]
+async fn http_hitl_cleared_pending_draft_is_recreated_by_same_submission_key() {
+    let state = test_server_state().await;
+    let name = "hitl-clear-retry";
+    seed_ready_sandbox(&state, name).await;
+    let chunk = hitl_chunk("/items");
+    let first = submit(&state, name, HTTP_HITL_ANALYSIS_MODE, chunk.clone()).await;
+    assert_eq!(first.accepted_chunks, 1, "{first:?}");
+    let deleted_id = &first.accepted_chunk_ids[0];
+    assert_eq!(draft(&state, name).await.chunks[0].status, "pending");
+
+    let cleared = handle_clear_draft_chunks(
+        &state,
+        authed_request(ClearDraftChunksRequest {
+            request_id: String::new(),
+            sandbox: name.into(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(cleared.chunks_cleared, 1);
+    assert!(
+        state
+            .store
+            .get_draft_chunk(deleted_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(draft(&state, name).await.chunks.is_empty());
+
+    let recreated = submit(&state, name, HTTP_HITL_ANALYSIS_MODE, chunk.clone()).await;
+    assert_eq!(recreated.accepted_chunks, 1, "{recreated:?}");
+    assert_ne!(recreated.accepted_chunk_ids, first.accepted_chunk_ids);
+    let review = draft(&state, name).await;
+    assert_eq!(review.chunks.len(), 1);
+    assert_eq!(review.chunks[0].id, recreated.accepted_chunk_ids[0]);
+    assert_eq!(review.chunks[0].status, "pending");
+    assert!(!review.chunks[0].review_token.is_empty());
+    let retry = submit(&state, name, HTTP_HITL_ANALYSIS_MODE, chunk).await;
+    assert_eq!(retry.accepted_chunk_ids, recreated.accepted_chunk_ids);
+    assert_eq!(draft(&state, name).await.chunks.len(), 1);
+}
+
+#[tokio::test]
 async fn http_hitl_concurrent_retries_share_one_stored_decision() {
     let state = test_server_state().await;
     let name = "hitl-concurrent";

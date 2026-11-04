@@ -17,6 +17,69 @@ fn snapshot(status: &str) -> GetDraftPolicyResponse {
 }
 
 #[tokio::test(start_paused = true)]
+async fn http_hitl_cleared_draft_is_resubmitted_and_observed() {
+    let (_workspace, service) = service();
+    let ledger = Mutex::new(HashMap::<String, PolicyChunk>::new());
+    let calls = AtomicUsize::new(0);
+    let submit = || {
+        service.submit_candidate("workspace-a", candidate("workspace-a", "/items"), |chunk| {
+            let ledger = &ledger;
+            let calls = &calls;
+            async move {
+                let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                // Model the gateway's durable submission-key lookup, not a
+                // local accepted-ID cache. Deletion removes the key as well.
+                let mut ledger = ledger.lock().await;
+                let stored = ledger
+                    .entry(chunk.id.clone())
+                    .or_insert_with(|| PolicyChunk {
+                        id: format!("durable-{attempt}"),
+                        status: "pending".into(),
+                        ..chunk
+                    });
+                Ok(accepted(&stored.id))
+            }
+        })
+    };
+    let observe = |id| {
+        service.observe_candidate("workspace-a", id, || async {
+            Ok(GetDraftPolicyResponse {
+                chunks: ledger.lock().await.values().cloned().collect(),
+                ..Default::default()
+            })
+        })
+    };
+
+    let deleted_id = submit().await.unwrap();
+    let submission_key = ledger.lock().await.keys().next().unwrap().clone();
+    assert_eq!(observe(&deleted_id).await, Ok(ReviewDecision::Pending));
+    ledger
+        .lock()
+        .await
+        .retain(|_, chunk| chunk.status != "pending");
+    advance(ATTEMPT_INTERVAL).await;
+    assert_eq!(observe(&deleted_id).await, Ok(ReviewDecision::Unknown));
+
+    // The same service/session and unchanged candidate must consult persistence
+    // again, even though its old accepted ID is no longer reviewable.
+    let replacement_id = submit().await.unwrap();
+    assert_ne!(replacement_id, deleted_id);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(submit().await.unwrap(), replacement_id);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    {
+        let ledger = ledger.lock().await;
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[&submission_key].id, replacement_id);
+    }
+    advance(ATTEMPT_INTERVAL).await;
+    assert_eq!(observe(&replacement_id).await, Ok(ReviewDecision::Pending));
+    ledger.lock().await.get_mut(&submission_key).unwrap().status = "approved".into();
+    advance(ATTEMPT_INTERVAL).await;
+    assert_eq!(observe(&replacement_id).await, Ok(ReviewDecision::Approved));
+}
+
+#[tokio::test(start_paused = true)]
 async fn http_hitl_review_batch_is_shared_and_refreshes_once_per_interval() {
     let (_workspace, service) = service();
     let calls = AtomicUsize::new(0);

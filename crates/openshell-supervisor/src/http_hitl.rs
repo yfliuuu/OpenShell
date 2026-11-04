@@ -4,7 +4,7 @@
 //! Bounded, cancellation-owned submission of pending human-review proposals.
 //! Submission and coalesced read-only decision observation never authorize forwarding.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
@@ -23,7 +23,6 @@ use tokio::time::{Instant, sleep_until, timeout};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const ATTEMPT_INTERVAL: Duration = Duration::from_secs(1);
-const CACHE_CAPACITY: usize = 16;
 // Bound the existing all-drafts RPC without adding a new public API. Oversized
 // ledgers fail closed; never accept a truncated response as a complete snapshot.
 const REVIEW_RESPONSE_BYTES: usize = 256 * 1024;
@@ -37,7 +36,6 @@ struct ReviewState {
 
 struct SubmissionState {
     next_attempt: Instant,
-    accepted: VecDeque<(String, String)>,
 }
 
 pub struct ProposalService {
@@ -62,7 +60,6 @@ impl ProposalService {
             session_id: uuid::Uuid::new_v4(),
             state: Mutex::new(SubmissionState {
                 next_attempt: Instant::now(),
-                accepted: VecDeque::with_capacity(CACHE_CAPACITY),
             }),
             review: Mutex::new(ReviewState {
                 next_attempt: Instant::now(),
@@ -149,14 +146,14 @@ impl ProposalService {
         self.check_workspace(workspace)?;
         let fingerprint = http_hitl_submission_fingerprint(&chunk);
         chunk.id = format!("{}:{fingerprint}", self.session_id);
-        // One lock bounds memory and serializes every connect/sleep/RPC across
-        // waiters. All work is owned by this future; dropping it cancels work.
+        // Resolve every submission through gateway persistence using the stable
+        // session/content key. A cached accepted ID could refer to a draft that
+        // ClearDraftChunks deleted. Durable dedup preserves existing decisions
+        // and recreates a pending draft only when its record no longer exists.
+        // One lock serializes every connect/sleep/RPC across waiters. All work
+        // is owned by this future; dropping it cancels work.
         let mut state = self.state.lock().await;
         self.check_workspace(workspace)?;
-        if let Some((_, id)) = state.accepted.iter().find(|(key, _)| key == &fingerprint) {
-            self.check_workspace(workspace)?;
-            return Ok(id.clone());
-        }
         sleep_until(state.next_attempt).await;
         self.check_workspace(workspace)?;
         // Reserve before awaiting: cancellation or transport failure must not
@@ -166,10 +163,6 @@ impl ProposalService {
         self.check_workspace(workspace)?;
         let response = result.map_err(|_| ProposalSubmitError::Retryable)??;
         let id = accepted_id(response)?;
-        if state.accepted.len() == CACHE_CAPACITY {
-            state.accepted.pop_front();
-        }
-        state.accepted.push_back((fingerprint, id.clone()));
         self.check_workspace(workspace)?;
         Ok(id)
     }
