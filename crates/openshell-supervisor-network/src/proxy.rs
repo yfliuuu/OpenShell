@@ -2633,7 +2633,13 @@ async fn handle_mediated_connection(
             // order aborts transport before the reservation is released.
             let mut session =
                 crate::l7::session::HttpSession::from_reader(client, first_request_slot);
-            held::resume_after_review(&mut session, &held_environment, false).await?;
+            held::resume_after_review(
+                &mut session,
+                &held_environment,
+                held::HeldProxyMode::Forward,
+                false,
+            )
+            .await?;
         }
         return result;
     }
@@ -3158,7 +3164,7 @@ async fn handle_mediated_connection(
                     tls_client,
                     tls_upstream,
                     relay_context,
-                    Some((&held_environment, true)),
+                    Some((&held_environment, held::HeldProxyMode::Connect, true)),
                 ))
                 .await
             };
@@ -3237,7 +3243,7 @@ async fn handle_mediated_connection(
             client,
             upstream,
             relay_context,
-            Some((&held_environment, false)),
+            Some((&held_environment, held::HeldProxyMode::Connect, false)),
         )
         .await
         {

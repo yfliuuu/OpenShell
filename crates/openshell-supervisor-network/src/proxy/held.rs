@@ -5,12 +5,20 @@
 //! frozen REST exchange. Current-executor continuity is explicitly deferred.
 
 use super::*;
+use crate::l7::provider::L7Request;
 use crate::l7::session::{HttpSession, ReviewWaitOutcome};
 use crate::l7::wait::ResumeFence;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+/// Trusted ingress mode, independent of request-target syntax and TLS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HeldProxyMode {
+    Connect,
+    Forward,
+}
 
 pub(super) struct ResumeEnvironment {
     pub engine: Arc<OpaEngine>,
@@ -43,6 +51,7 @@ impl ResumeEnvironment {
 pub(super) async fn resume_after_review<C>(
     session: &mut HttpSession<C>,
     environment: &ResumeEnvironment,
+    mode: HeldProxyMode,
     tls: bool,
 ) -> Result<()>
 where
@@ -50,7 +59,7 @@ where
 {
     match session.wait_for_approval().await {
         Some(ReviewWaitOutcome::Covered { generation }) => {
-            let result = resume_once(session, environment, tls, generation).await;
+            let result = resume_once(session, environment, mode, tls, generation).await;
             // At most one attempt, even if a connect, write, response or flush failed.
             // No persistent decision can reconstruct this transport or revive Q.
             session.parts().1.terminate();
@@ -64,32 +73,15 @@ where
     }
 }
 
-async fn resume_once<C>(
-    session: &mut HttpSession<C>,
-    environment: &ResumeEnvironment,
-    tls: bool,
-    generation: u64,
-) -> Result<()>
-where
-    C: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    let slot = session.slot();
-    let input = slot
-        .held_input()
-        .ok_or_else(|| miette::miette!("held intent unavailable"))?;
-    let network = input
-        .captured_network_input()
-        .ok_or_else(|| miette::miette!("held scope unavailable"))?;
-    let workspace = input.workspace().to_owned();
-    environment.check_workspace(&workspace)?;
-    let mut request = slot
-        .frozen()
-        .ok_or_else(|| miette::miette!("held request unavailable"))?
-        .request()
-        .clone();
-    // FORWARD froze the original absolute-form header while retaining native
-    // canonical policy fields. Derive only an outgoing copy through the same
-    // native origin-form rewrite; never mutate frozen Q or rebuild its query.
+/// Rewrite an outgoing copy; the ingress mode comes only from the caller,
+/// never from a client-controlled target or the state of parser normalization.
+fn prepare_outgoing_request(
+    frozen: &L7Request,
+    mode: HeldProxyMode,
+    host: &str,
+    port: u16,
+) -> Result<L7Request> {
+    let mut request = frozen.clone();
     let line = std::str::from_utf8(&request.raw_header)
         .into_diagnostic()?
         .split("\r\n")
@@ -107,12 +99,61 @@ where
     if canonical.path != request.target {
         return Err(miette::miette!("held request canonical projection changed"));
     }
-    request.raw_header = crate::l7::rest::rewrite_request_line_target(
-        &request.raw_header,
-        &request.action,
-        &canonical.path,
-        query.as_deref(),
-        "HTTP/1.1",
+    request.raw_header = match mode {
+        HeldProxyMode::Connect => crate::l7::rest::rewrite_request_line_target(
+            &request.raw_header,
+            &request.action,
+            &canonical.path,
+            query.as_deref(),
+            "HTTP/1.1",
+        )?,
+        HeldProxyMode::Forward => {
+            // Reuse native FORWARD sanitization even if a parser already made
+            // the target origin-form. Live credentials are prepared later,
+            // only after fresh admission in relay_held_rest_once.
+            let upstream_target = match query.as_deref() {
+                Some(query) if !query.is_empty() => format!("{}?{query}", canonical.path),
+                _ => canonical.path,
+            };
+            rewrite_forward_request(
+                &request.raw_header,
+                request.raw_header.len(),
+                &upstream_target,
+                &canonical_forward_authority(host, port),
+                None,
+            )
+            .map_err(miette::Report::new)?
+        }
+    };
+    Ok(request)
+}
+
+async fn resume_once<C>(
+    session: &mut HttpSession<C>,
+    environment: &ResumeEnvironment,
+    mode: HeldProxyMode,
+    tls: bool,
+    generation: u64,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let slot = session.slot();
+    let input = slot
+        .held_input()
+        .ok_or_else(|| miette::miette!("held intent unavailable"))?;
+    let network = input
+        .captured_network_input()
+        .ok_or_else(|| miette::miette!("held scope unavailable"))?;
+    let workspace = input.workspace().to_owned();
+    environment.check_workspace(&workspace)?;
+    let request = prepare_outgoing_request(
+        slot.frozen()
+            .ok_or_else(|| miette::miette!("held request unavailable"))?
+            .request(),
+        mode,
+        &network.host,
+        network.port,
     )?;
     let request_id = slot.review_request_id().unwrap_or_default().to_owned();
     let guard = slot

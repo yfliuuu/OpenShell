@@ -251,7 +251,11 @@ pub(super) async fn relay_http_stream_with_resume<C, U>(
     client: C,
     mut upstream: U,
     context: RelayContext<'_>,
-    resume: Option<(&super::held::ResumeEnvironment, bool)>,
+    resume: Option<(
+        &super::held::ResumeEnvironment,
+        super::held::HeldProxyMode,
+        bool,
+    )>,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -267,8 +271,8 @@ where
         HttpRelayExit::PendingReview => {
             // Drop old upstream/evaluator before the client begins waiting.
             drop(upstream);
-            if let Some((environment, tls)) = resume {
-                super::held::resume_after_review(&mut session, environment, tls).await?;
+            if let Some((environment, mode, tls)) = resume {
+                super::held::resume_after_review(&mut session, environment, mode, tls).await?;
             } else {
                 let _ = session.wait_no_release().await;
             }

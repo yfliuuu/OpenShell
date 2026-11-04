@@ -44,7 +44,12 @@ impl crate::l7::proposal::HeldProposalService for HeldIntentRecorder {
             assert_eq!(input.scope().endpoints.len(), 1);
             assert!(input.scope().endpoints[0].rules.is_empty());
             let metadata = input.review_metadata();
-            for secret in ["query-sentinel", "header-sentinel", "cookie-sentinel"] {
+            for secret in [
+                "query-sentinel",
+                "header-sentinel",
+                "cookie-sentinel",
+                "proxy-auth-sentinel",
+            ] {
                 assert!(!metadata.contains(secret));
             }
             self.metadata.lock().unwrap().push(metadata);
@@ -113,6 +118,19 @@ async fn serve_held_once<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
     }
     assert!(header.contains("Authorization: header-sentinel\r\n"));
     assert!(header.contains("Cookie: cookie-sentinel\r\n"));
+    let lower_header = header.to_ascii_lowercase();
+    for forbidden in [
+        "proxy-authorization:",
+        "proxy-connection:",
+        "proxy-authenticate:",
+        "proxy-auth-sentinel",
+        "x-proxy-hop:",
+    ] {
+        assert!(
+            !lower_header.contains(forbidden),
+            "proxy-only header or credential reached upstream: {forbidden}"
+        );
+    }
     stream.write_all(HELD_RESPONSE).await.unwrap();
     stream.flush().await.unwrap();
     // Keep the upstream alive until the one-shot relay drops it. Any replay
@@ -295,6 +313,23 @@ async fn explicit_and_virtual_connect_production_ingress_resume_once() {
 
 #[tokio::test]
 async fn forward_production_ingress_resume_once_without_early_dial() {
+    held_forward_resume_case("").await;
+}
+
+#[tokio::test]
+async fn forward_production_ingress_resume_strips_proxy_credentials() {
+    held_forward_resume_case(concat!(
+        "Proxy-Authorization: Basic proxy-auth-sentinel\r\n",
+        "pRoXy-AuThOrIzAtIoN: Basic repeated-proxy-auth-sentinel\r\n",
+        "Proxy-Connection: keep-alive\r\n",
+        "pRoXy-AuThEnTiCaTe: Basic realm=proxy-auth-sentinel\r\n",
+        "Connection: X-Proxy-Hop\r\n",
+        "X-Proxy-Hop: proxy-auth-sentinel\r\n",
+    ))
+    .await;
+}
+
+async fn held_forward_resume_case(proxy_headers: &str) {
     let Some(ip) = non_loopback_test_ipv4() else {
         eprintln!("skipping FORWARD resume fixture: no routable local test address");
         return;
@@ -324,7 +359,7 @@ async fn forward_production_ingress_resume_once_without_early_dial() {
         };
         let (client, mut wire) = tokio::io::duplex(8192);
         let request = format!(
-            "GET http://{destination}/a/../missing?secret=query-sentinel HTTP/1.1\r\nHost: {destination}\r\nAuthorization: header-sentinel\r\nCookie: cookie-sentinel\r\n\r\n"
+            "GET http://{destination}/a/../missing?secret=query-sentinel HTTP/1.1\r\nHost: {destination}\r\nAuthorization: header-sentinel\r\nCookie: cookie-sentinel\r\n{proxy_headers}\r\n"
         );
         let handler = Box::pin(handle_mediated_connection(
             tokio::io::BufReader::new(Box::new(client)),

@@ -29,6 +29,74 @@ network_policies:
       - path: /usr/bin/curl
 ";
 
+#[test]
+fn forward_mode_sanitizes_both_target_forms_without_mutating_frozen_request() {
+    for target in [
+        "/a/../missing?secret=query-sentinel&x=%2f&x=two+words",
+        "http://example.com/a/../missing?secret=query-sentinel&x=%2f&x=two+words",
+    ] {
+        let raw = format!(
+            "GET {target} HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic proxy-auth-sentinel\r\npRoXy-AuThOrIzAtIoN: Basic duplicate-proxy-auth-sentinel\r\nProxy-Connection: keep-alive\r\npRoXy-AuThEnTiCaTe: Basic realm=proxy-auth-sentinel\r\nConnection: X-Proxy-Hop\r\nX-Proxy-Hop: proxy-auth-sentinel\r\nAuthorization: business-auth-sentinel\r\nCookie: business-cookie-sentinel\r\n\r\n"
+        );
+        let frozen = crate::l7::rest::request_from_buffered_http(
+            "GET",
+            "/missing",
+            "/missing?secret=query-sentinel&x=%2f&x=two+words",
+            raw.as_bytes().to_vec(),
+        )
+        .unwrap();
+        let outgoing =
+            prepare_outgoing_request(&frozen, HeldProxyMode::Forward, "example.com", 80).unwrap();
+        let header = std::str::from_utf8(&outgoing.raw_header).unwrap();
+        assert!(
+            header.starts_with("GET /missing?secret=query-sentinel&x=%2f&x=two+words HTTP/1.1\r\n")
+        );
+        assert!(header.contains("Host: example.com\r\n"));
+        assert!(header.contains("Authorization: business-auth-sentinel\r\n"));
+        assert!(header.contains("Cookie: business-cookie-sentinel\r\n"));
+        assert!(header.contains("Connection: close\r\n"));
+        assert!(header.contains("Via: 1.1 openshell-sandbox\r\n"));
+        let lower = header.to_ascii_lowercase();
+        for forbidden in [
+            "proxy-authorization:",
+            "proxy-connection:",
+            "proxy-authenticate:",
+            "proxy-auth-sentinel",
+            "x-proxy-hop:",
+        ] {
+            assert!(!lower.contains(forbidden), "outgoing leaked {forbidden}");
+        }
+        assert_eq!(frozen.raw_header, raw.as_bytes());
+        assert_eq!(outgoing.action, frozen.action);
+        assert_eq!(outgoing.target, frozen.target);
+        assert_eq!(outgoing.query_params, frozen.query_params);
+        assert_eq!(outgoing.body_length, frozen.body_length);
+    }
+}
+
+#[test]
+fn connect_mode_does_not_infer_forward_from_absolute_target() {
+    for target in ["/missing?x=%2f", "http://example.com/missing?x=%2f"] {
+        let raw = format!(
+            "GET {target} HTTP/1.1\r\nHost: example.com\r\nAuthorization: business-auth-sentinel\r\n\r\n"
+        );
+        let frozen = crate::l7::rest::request_from_buffered_http(
+            "GET",
+            "/missing",
+            "/missing?x=%2f",
+            raw.as_bytes().to_vec(),
+        )
+        .unwrap();
+        let outgoing =
+            prepare_outgoing_request(&frozen, HeldProxyMode::Connect, "example.com", 80).unwrap();
+        assert_eq!(
+            outgoing.raw_header,
+            b"GET /missing?x=%2f HTTP/1.1\r\nHost: example.com\r\nAuthorization: business-auth-sentinel\r\n\r\n"
+        );
+        assert_eq!(frozen.raw_header, raw.as_bytes());
+    }
+}
+
 struct Fixture {
     environment: ResumeEnvironment,
     runtime: Arc<WaitRuntime>,
