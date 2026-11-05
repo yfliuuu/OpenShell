@@ -23,14 +23,15 @@ impl crate::l7::proposal::HeldProposalService for HeldIntentRecorder {
         Box::pin(async move {
             assert_eq!(workspace, "fixture-team");
             assert_eq!(chunk_id, "durable-fixture-chunk");
-            let decision = match self.decision.load(Ordering::Acquire) {
-                0 => crate::l7::proposal::ReviewDecision::Pending,
-                1 => crate::l7::proposal::ReviewDecision::Approved,
-                2 => crate::l7::proposal::ReviewDecision::Rejected,
-                _ => unreachable!(),
-            };
             self.observations.fetch_add(1, Ordering::Release);
-            Ok(decision)
+            match self.decision.load(Ordering::Acquire) {
+                0 => Ok(crate::l7::proposal::ReviewDecision::Pending),
+                1 => Ok(crate::l7::proposal::ReviewDecision::Approved),
+                2 => Ok(crate::l7::proposal::ReviewDecision::Rejected),
+                3 => Err(crate::l7::proposal::ProposalSubmitError::Unavailable),
+                4 => Err(crate::l7::proposal::ProposalSubmitError::Retryable),
+                _ => unreachable!(),
+            }
         })
     }
 
@@ -61,6 +62,39 @@ impl crate::l7::proposal::HeldProposalService for HeldIntentRecorder {
 
 const HELD_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nheld-response!";
+
+pub(super) fn assert_held_terminal_response(
+    response: &[u8],
+    status: u16,
+    error: &str,
+    reason: &str,
+) {
+    let boundary = response
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .expect("held terminal must return an HTTP response, not EOF")
+        + 4;
+    let header = std::str::from_utf8(&response[..boundary]).unwrap();
+    assert!(header.starts_with(&format!("HTTP/1.1 {status} ")));
+    assert!(header.contains("Content-Type: application/json\r\n"));
+    assert!(header.contains("Connection: close\r\n"));
+    assert!(header.contains(&format!(
+        "Content-Length: {}\r\n",
+        response.len() - boundary
+    )));
+    let body: serde_json::Value = serde_json::from_slice(&response[boundary..]).unwrap();
+    assert_eq!(body["error"], error);
+    assert_eq!(body["reason"], reason);
+    assert!(response.len() < 1024);
+    for secret in [
+        "query-sentinel",
+        "header-sentinel",
+        "cookie-sentinel",
+        "proxy-auth-sentinel",
+    ] {
+        assert!(!String::from_utf8_lossy(response).contains(secret));
+    }
+}
 
 async fn assert_no_held_dial(listener: &TcpListener) {
     let accept = listener.accept();
@@ -204,6 +238,21 @@ async fn answer_held_proxy_connect(stream: &mut TcpStream, destination: SocketAd
 }
 
 async fn held_connect_resume_case(route: HeldConnectRoute) {
+    held_connect_case(route, None).await;
+}
+
+#[tokio::test]
+async fn plaintext_explicit_and_virtual_connect_terminal_responses_never_redial() {
+    for end in [
+        HeldForwardEnd::Rejected,
+        HeldForwardEnd::Timeout,
+        HeldForwardEnd::Unavailable,
+    ] {
+        held_connect_case(HeldConnectRoute::Direct, Some(end)).await;
+    }
+}
+
+async fn held_connect_case(route: HeldConnectRoute, terminal: Option<HeldForwardEnd>) {
     let Some(ip) = non_loopback_test_ipv4() else {
         eprintln!("skipping CONNECT wait fixture: no routable local test address");
         return;
@@ -229,6 +278,7 @@ async fn held_connect_resume_case(route: HeldConnectRoute) {
                     .unwrap(),
             );
             engine.set_http_hitl_wait_enabled(true);
+            if let Some(end) = terminal { end.configure_deadline(&engine); }
             engine.attach_http_hitl_policy_observer();
             let recorder = Arc::new(HeldIntentRecorder::default());
             engine.set_http_hitl_proposal_service(recorder.clone());
@@ -349,6 +399,20 @@ async fn held_connect_resume_case(route: HeldConnectRoute) {
                     result = handler.as_mut() => panic!("CONNECT exited before envelope response: {result:?}"),
                 }
                 assert_eq!(response, expected);
+            }
+            if let Some(end) = terminal {
+                recorder.decision.store(end.decision(), Ordering::Release);
+                engine.reload(include_str!("../../../data/sandbox-policy.rego"), &data.replace("path: /allowed", "path: /missing")).unwrap();
+                let client = async { read_held_close(&mut wire, false).await };
+                let (result, response) = tokio::join!(handler, client);
+                result.unwrap();
+                end.assert_response(&response);
+                for listener in [listener, proxy_listener] {
+                    assert_eq!(listener.into_std().unwrap().accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+                }
+                assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
+                assert_eq!(recorder.metadata.lock().unwrap().len(), 1);
+                continue;
             }
             engine
                 .reload(include_str!("../../../data/sandbox-policy.rego"), &data)
@@ -618,9 +682,80 @@ async fn held_test_handler(
 #[derive(Clone, Copy, Debug)]
 enum HeldForwardEnd {
     Rejected,
+    Timeout,
+    Unavailable,
+    UnavailableThroughDeadline,
     Disabled,
     DefaultOff,
     ClientClosed,
+}
+
+impl HeldForwardEnd {
+    fn expected_reason(self) -> Option<WaitEnd> {
+        match self {
+            Self::Rejected => Some(WaitEnd::ProposalRejected),
+            Self::Timeout => Some(WaitEnd::Deadline),
+            Self::Unavailable | Self::UnavailableThroughDeadline => {
+                Some(WaitEnd::ProposalUnavailable)
+            }
+            Self::Disabled => Some(WaitEnd::Disabled),
+            Self::ClientClosed => Some(WaitEnd::ClientClosed),
+            Self::DefaultOff => None,
+        }
+    }
+
+    fn decision(self) -> u32 {
+        match self {
+            Self::Rejected => 2,
+            Self::Timeout => 0,
+            Self::Unavailable => 3,
+            Self::UnavailableThroughDeadline => 4,
+            Self::Disabled | Self::ClientClosed => 1,
+            Self::DefaultOff => unreachable!(),
+        }
+    }
+
+    fn assert_response(self, response: &[u8]) {
+        match self {
+            Self::Rejected => assert_held_terminal_response(
+                response,
+                403,
+                "approval_rejected",
+                "approval_rejected",
+            ),
+            Self::Timeout => {
+                assert_held_terminal_response(
+                    response,
+                    504,
+                    "approval_timeout",
+                    "approval_timeout",
+                );
+            }
+            Self::Unavailable | Self::UnavailableThroughDeadline => assert_held_terminal_response(
+                response,
+                503,
+                "approval_unavailable",
+                "approval_unavailable",
+            ),
+            Self::Disabled => assert_held_terminal_response(
+                response,
+                503,
+                "approval_unavailable",
+                "approval_disabled",
+            ),
+            Self::ClientClosed => assert!(
+                response.is_empty(),
+                "closed client must not receive a response"
+            ),
+            Self::DefaultOff => unreachable!(),
+        }
+    }
+
+    fn configure_deadline(self, engine: &OpaEngine) {
+        if matches!(self, Self::Timeout | Self::UnavailableThroughDeadline) {
+            engine.set_http_hitl_wait_limits(std::time::Duration::from_secs(1), 16, 4);
+        }
+    }
 }
 
 async fn held_forward_terminal_case(end: HeldForwardEnd) {
@@ -632,6 +767,7 @@ async fn held_forward_terminal_case(end: HeldForwardEnd) {
         let listener = TcpListener::bind((ip, 0)).await.unwrap();
         let destination = listener.local_addr().unwrap();
         let (engine, recorder, data) = held_test_engine(destination);
+        end.configure_deadline(&engine);
         if !matches!(end, HeldForwardEnd::DefaultOff) {
             engine.set_http_hitl_wait_enabled(true);
         }
@@ -645,14 +781,13 @@ async fn held_forward_terminal_case(end: HeldForwardEnd) {
             drive_held_until(handler.as_mut(), || recorder.observations.load(Ordering::Acquire) > 0).await;
             assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
             assert_no_held_dial(&listener).await;
+            recorder.decision.store(end.decision(), Ordering::Release);
             match end {
-                HeldForwardEnd::Rejected => recorder.decision.store(2, Ordering::Release),
+                HeldForwardEnd::Rejected | HeldForwardEnd::Timeout | HeldForwardEnd::Unavailable | HeldForwardEnd::UnavailableThroughDeadline => {}
                 HeldForwardEnd::Disabled => {
-                    recorder.decision.store(1, Ordering::Release);
                     engine.set_http_hitl_wait_enabled(false);
                 }
                 HeldForwardEnd::ClientClosed => {
-                    recorder.decision.store(1, Ordering::Release);
                     wire.shutdown().await.unwrap();
                 }
                 HeldForwardEnd::DefaultOff => unreachable!(),
@@ -663,27 +798,20 @@ async fn held_forward_terminal_case(end: HeldForwardEnd) {
         }
         let client = async { read_held_close(&mut wire, false).await };
         let (result, response) = tokio::join!(handler, client);
-        match end {
-            HeldForwardEnd::DefaultOff => result.unwrap(),
-            HeldForwardEnd::Rejected | HeldForwardEnd::Disabled | HeldForwardEnd::ClientClosed => {
-                let expected_reason = match end {
-                    HeldForwardEnd::Rejected => WaitEnd::ProposalRejected,
-                    HeldForwardEnd::Disabled => WaitEnd::Disabled,
-                    HeldForwardEnd::ClientClosed => WaitEnd::ClientClosed,
-                    HeldForwardEnd::DefaultOff => unreachable!(),
-                };
-                // A held terminal is an explicit error, unlike the ordinary
-                // default-off denial. Do not accept unrelated handler failures.
-                let error = result.expect_err("terminal hold must not complete as a resumed request");
-                assert_eq!(
-                    error.to_string(),
-                    format!(
-                        "held review ended before fresh admission: reason={} ({expected_reason:?})",
-                        expected_reason.reason_code()
-                    ),
-                    "wrong terminal result for {end:?}"
-                );
-            }
+        if let Some(expected_reason) = end.expected_reason() {
+            // A held terminal is an explicit error, unlike the ordinary
+            // default-off denial. Do not accept unrelated handler failures.
+            let error = result.expect_err("terminal hold must not complete as a resumed request");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "held review ended before fresh admission: reason={} ({expected_reason:?})",
+                    expected_reason.reason_code()
+                ),
+                "wrong terminal result for {end:?}"
+            );
+        } else {
+            result.unwrap();
         }
         // The handler has retired. Inspect the kernel backlog, not a possibly
         // stale Tokio readiness cache, to prove no connection was attempted.
@@ -695,7 +823,7 @@ async fn held_forward_terminal_case(end: HeldForwardEnd) {
             assert!(recorder.metadata.lock().unwrap().is_empty());
             assert_eq!(recorder.observations.load(Ordering::Acquire), 0);
         } else {
-            assert!(response.is_empty(), "terminal hold must not produce an upstream response");
+            end.assert_response(&response);
             assert_eq!(recorder.metadata.lock().unwrap().len(), 1);
         }
     })).await.unwrap_or_else(|_| panic!("FORWARD terminal case timed out: {end:?}"));
@@ -704,6 +832,21 @@ async fn held_forward_terminal_case(end: HeldForwardEnd) {
 #[tokio::test]
 async fn forward_production_ingress_rejected_never_dials() {
     held_forward_terminal_case(HeldForwardEnd::Rejected).await;
+}
+
+#[tokio::test]
+async fn forward_production_ingress_timeout_returns_504_without_dialing() {
+    held_forward_terminal_case(HeldForwardEnd::Timeout).await;
+}
+
+#[tokio::test]
+async fn forward_production_ingress_unavailable_returns_503_without_dialing() {
+    held_forward_terminal_case(HeldForwardEnd::Unavailable).await;
+}
+
+#[tokio::test]
+async fn forward_production_ingress_gateway_down_through_deadline_returns_503() {
+    held_forward_terminal_case(HeldForwardEnd::UnavailableThroughDeadline).await;
 }
 
 #[tokio::test]
@@ -727,6 +870,23 @@ enum HeldTlsEnd {
     StaleBeforeWrite,
     ClientClosedBeforeWrite,
     SimulatedRejectedBeforeReadmission,
+    SimulatedTimeoutBeforeReadmission,
+    SimulatedUnavailableBeforeReadmission,
+    SimulatedUnavailableThroughDeadline,
+}
+
+impl HeldTlsEnd {
+    fn terminal(self) -> Option<HeldForwardEnd> {
+        match self {
+            Self::SimulatedRejectedBeforeReadmission => Some(HeldForwardEnd::Rejected),
+            Self::SimulatedTimeoutBeforeReadmission => Some(HeldForwardEnd::Timeout),
+            Self::SimulatedUnavailableBeforeReadmission => Some(HeldForwardEnd::Unavailable),
+            Self::SimulatedUnavailableThroughDeadline => {
+                Some(HeldForwardEnd::UnavailableThroughDeadline)
+            }
+            _ => None,
+        }
+    }
 }
 
 async fn held_tls_ingress_case(
@@ -743,6 +903,7 @@ async fn held_tls_ingress_case(
         let destination = listener.local_addr().unwrap();
         let (engine, recorder, data) = held_test_engine(destination);
         engine.set_http_hitl_wait_enabled(true);
+        if let Some(end) = end.terminal() { end.configure_deadline(&engine); }
         let ca = crate::l7::tls::SandboxCa::generate().unwrap();
         let mut roots = rustls::RootCertStore::empty();
         for cert in rustls_pemfile::certs(&mut ca.cert_pem().as_bytes()) {
@@ -810,21 +971,21 @@ async fn held_tls_ingress_case(
         drive_held_until(handler.as_mut(), || recorder.observations.load(Ordering::Acquire) > observations).await;
         assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
         assert_no_held_dial(&listener).await;
-        if matches!(end, HeldTlsEnd::SimulatedRejectedBeforeReadmission) {
+        if let Some(terminal) = end.terminal() {
             // BOTH original and retired-upstream handshakes have completed.
             // Installed coverage alone above still holds Q while the simulated
             // HeldProposalService says Pending. Rejection must now retire Q,
             // not dial a fresh peer even though coverage remains installed.
             assert_eq!(recorder.decision.load(Ordering::Acquire), 0);
-            recorder.decision.store(2, Ordering::Release);
+            recorder.decision.store(terminal.decision(), Ordering::Release);
             engine.reload(include_str!("../../../data/sandbox-policy.rego"), &covered).unwrap();
             let client = async {
-                assert!(read_held_close(&mut wire, true).await.is_empty(), "rejected original TLS client must reach EOF without HTTP");
+                terminal.assert_response(&read_held_close(&mut wire, true).await);
                 assert_eq!(wire.get_ref().1.protocol_version(), Some(original_version.version));
             };
             let (result, ()) = tokio::join!(handler, client);
             result.unwrap();
-            assert_no_held_dial(&listener).await;
+            assert_eq!(listener.into_std().unwrap().accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
             assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
             assert_eq!(recorder.metadata.lock().unwrap().len(), 1);
             return;
@@ -871,7 +1032,9 @@ async fn held_tls_ingress_case(
                 let (result, (), ()) = tokio::join!(handler, server, client);
                 result.unwrap();
             }
-            HeldTlsEnd::SimulatedRejectedBeforeReadmission => unreachable!("rejection retires before fresh dial"),
+            HeldTlsEnd::SimulatedRejectedBeforeReadmission | HeldTlsEnd::SimulatedTimeoutBeforeReadmission |
+            HeldTlsEnd::SimulatedUnavailableBeforeReadmission | HeldTlsEnd::SimulatedUnavailableThroughDeadline =>
+                unreachable!("review terminal retires before fresh dial"),
         }
         assert_no_held_dial(&listener).await;
         assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
@@ -919,6 +1082,19 @@ async fn connect_production_ingress_simulated_rejection_after_covered_pending_tl
                 HeldTlsEnd::SimulatedRejectedBeforeReadmission,
             )
             .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn connect_original_tls_timeout_and_unavailable_return_local_responses() {
+    for original in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        for end in [
+            HeldTlsEnd::SimulatedTimeoutBeforeReadmission,
+            HeldTlsEnd::SimulatedUnavailableBeforeReadmission,
+            HeldTlsEnd::SimulatedUnavailableThroughDeadline,
+        ] {
+            held_tls_ingress_case(original, &rustls::version::TLS13, end).await;
         }
     }
 }

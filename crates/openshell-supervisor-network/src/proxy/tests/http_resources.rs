@@ -237,14 +237,49 @@ async fn cycle(end: End, round: usize) {
     for client in &mut clients {
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
-        if matches!(end, End::Response) {
-            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
-            assert!(response.ends_with(b"OK"));
-        } else {
-            assert!(
-                response.is_empty(),
-                "terminal request must not produce an upstream response"
-            );
+        match end {
+            End::Response => {
+                assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+                assert!(response.ends_with(b"OK"));
+            }
+            End::Rejected => http_wait::assert_held_terminal_response(
+                &response,
+                403,
+                "approval_rejected",
+                "approval_rejected",
+            ),
+            End::Deadline => http_wait::assert_held_terminal_response(
+                &response,
+                504,
+                "approval_timeout",
+                "approval_timeout",
+            ),
+            End::Disabled => http_wait::assert_held_terminal_response(
+                &response,
+                503,
+                "approval_unavailable",
+                "approval_disabled",
+            ),
+            End::ReviewUnavailable => http_wait::assert_held_terminal_response(
+                &response,
+                503,
+                "approval_unavailable",
+                "approval_unavailable",
+            ),
+            // Aborting the accept loop drops its wait-runtime shutdown guard;
+            // existing handler tasks still own connected client transports.
+            End::ProxyShutdown => http_wait::assert_held_terminal_response(
+                &response,
+                503,
+                "approval_unavailable",
+                "approval_shutdown",
+            ),
+            End::ClientClosed => {
+                assert!(
+                    response.is_empty(),
+                    "closed/aborted transport must not receive a reply"
+                );
+            }
         }
     }
     if paused {

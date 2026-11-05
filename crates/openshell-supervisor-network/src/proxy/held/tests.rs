@@ -12,6 +12,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+mod terminal;
+
 const WORKSPACE: &str = "fixture-team";
 const REQUEST: &[u8] = b"GET /allowed HTTP/1.1\r\nHost: example.com\r\n\r\n";
 const REGO: &str = include_str!("../../../data/sandbox-policy.rego");

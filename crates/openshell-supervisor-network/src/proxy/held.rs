@@ -7,11 +7,13 @@
 use super::*;
 use crate::l7::provider::L7Request;
 use crate::l7::session::{HttpSession, ReviewWaitOutcome};
-use crate::l7::wait::ResumeFence;
+use crate::l7::wait::{ResumeFence, WaitEnd};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+const TERMINAL_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Trusted ingress mode, independent of request-target syntax and TLS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +59,13 @@ pub(super) async fn resume_after_review<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // The terminal wait discards Q, but keeps the original transport and quota.
+    // Retain only the HEAD response convention and the no-upstream-write fence.
+    let head = session
+        .slot()
+        .frozen()
+        .is_some_and(|frozen| frozen.request().action == "HEAD");
+    let fence = session.slot().resume_fence();
     match session.wait_for_approval().await {
         Some(ReviewWaitOutcome::Covered { generation }) => {
             let result = resume_once(session, environment, mode, tls, generation).await;
@@ -65,12 +74,87 @@ where
             session.parts().1.terminate();
             result
         }
-        Some(ReviewWaitOutcome::Terminal(reason)) => Err(miette::miette!(
-            "held review ended before fresh admission: reason={} ({reason:?})",
-            reason.reason_code()
-        )),
+        Some(ReviewWaitOutcome::Terminal(reason)) => {
+            if let Some(fence) = fence {
+                let (client, _) = session.parts();
+                // Best effort, once: write failure must not revive Q or replace
+                // its authoritative terminal reason. The owner then drops TCP/TLS
+                // before returning quota, including on cancellation or timeout.
+                let _ = send_terminal_response(client, &fence, reason, head).await;
+            }
+            Err(miette::miette!(
+                "held review ended before fresh admission: reason={} ({reason:?})",
+                reason.reason_code()
+            ))
+        }
         None => Ok(()),
     }
+}
+
+fn terminal_response(reason: WaitEnd, head: bool) -> Option<Vec<u8>> {
+    let (status, status_text, error) = match reason {
+        WaitEnd::ProposalRejected => (403, "Forbidden", "approval_rejected"),
+        WaitEnd::Deadline => (504, "Gateway Timeout", "approval_timeout"),
+        WaitEnd::ProposalUnavailable
+        | WaitEnd::Disabled
+        | WaitEnd::Quarantined
+        | WaitEnd::Shutdown
+        | WaitEnd::PolicyChanged
+        | WaitEnd::CurrentExecutorUnavailable => {
+            (503, "Service Unavailable", "approval_unavailable")
+        }
+        WaitEnd::ClientClosed | WaitEnd::ClientError | WaitEnd::ExtraInput => return None,
+    };
+    // Fixed local diagnostics only: no captured headers, query, gateway error,
+    // policy material, or credentials may enter this response.
+    let mut response = build_json_error_response_with_reason(
+        status,
+        status_text,
+        error,
+        "HTTP request was not sent upstream",
+        reason.reason_code(),
+    );
+    if head {
+        // HEAD has the same representation length, but no response body.
+        let boundary = response.windows(4).position(|bytes| bytes == b"\r\n\r\n")? + 4;
+        response.truncate(boundary);
+    }
+    Some(response)
+}
+
+async fn send_terminal_response<C>(
+    client: &mut C,
+    fence: &ResumeFence,
+    reason: WaitEnd,
+    head: bool,
+) -> io::Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    if fence.has_started() {
+        return Ok(());
+    }
+    let Some(response) = terminal_response(reason, head) else {
+        return Ok(());
+    };
+    // This separate, short budget is for a local error reply only. It cannot
+    // extend approval, grant readmission, or start an upstream HTTP exchange.
+    tokio::time::timeout(TERMINAL_RESPONSE_TIMEOUT, async {
+        let (mut reader, mut writer) = tokio::io::split(client);
+        let mut extra = [0u8; 1];
+        tokio::select! {
+            biased;
+            // EOF, read error, or pipelined input wins over writing a reply.
+            _ = reader.read(&mut extra) => Ok(()),
+            result = async {
+                writer.write_all(&response).await?;
+                writer.flush().await?;
+                writer.shutdown().await
+            } => result,
+        }
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "held terminal response timed out"))?
 }
 
 /// Rewrite an outgoing copy; the ingress mode comes only from the caller,

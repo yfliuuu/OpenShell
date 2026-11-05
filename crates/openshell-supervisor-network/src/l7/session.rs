@@ -466,6 +466,9 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
         }
         let waiter = self.slot.waiter.as_ref()?;
         let mut completed_observations = 0_u32;
+        // Distinguish waiting for a human/activation from a gateway that still
+        // fails at the original deadline. Successful RPCs clear this flag.
+        let mut review_unavailable = false;
         let outcome = 'waiting: {
             if self.slot.submitted_proposal.is_none()
                 && let (Some(service), Some(input)) =
@@ -474,11 +477,15 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                 let submission = async {
                     loop {
                         match service.submit(input).await {
-                            Ok(chunk_id) if !chunk_id.is_empty() => break Some(chunk_id),
+                            Ok(chunk_id) if !chunk_id.is_empty() => {
+                                review_unavailable = false;
+                                break Some(chunk_id);
+                            }
                             Ok(_) | Err(super::proposal::ProposalSubmitError::Unavailable) => {
                                 break None;
                             }
                             Err(super::proposal::ProposalSubmitError::Retryable) => {
+                                review_unavailable = true;
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             }
                         }
@@ -527,6 +534,8 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                         use super::proposal::{ProposalSubmitError, ReviewDecision};
                         let guard = waiter.policy_guard();
                         let decision = service.observe(input.workspace(), chunk_id).await;
+                        review_unavailable =
+                            matches!(decision, Err(ProposalSubmitError::Retryable));
                         completed_observations = completed_observations.saturating_add(1);
                         let next = match decision {
                             Ok(ReviewDecision::Rejected) => {
@@ -608,6 +617,11 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
             return Some(outcome);
         };
         let (host, port) = waiter.destination();
+        let reason = if reason == super::wait::WaitEnd::Deadline && review_unavailable {
+            super::wait::WaitEnd::ProposalUnavailable
+        } else {
+            reason
+        };
         let reason_code = reason.reason_code();
         ocsf_emit!(
             NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -627,7 +641,7 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                 .build()
         );
         self.slot.terminate();
-        Some(outcome)
+        Some(ReviewWaitOutcome::Terminal(reason))
     }
 
     /// Borrow without unwrapping the reader or replacing the client TLS object.

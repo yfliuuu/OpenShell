@@ -902,6 +902,75 @@ async fn original_tls_object_survives_partial_capture_cancellation() {
 
 struct ApprovalReviewer(std::sync::Mutex<crate::l7::proposal::ReviewDecision>);
 
+struct AvailabilityReviewer {
+    fail_submission: bool,
+    recover_observation: bool,
+    observations: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::l7::proposal::HeldProposalService for AvailabilityReviewer {
+    fn submit<'a>(
+        &'a self,
+        _: &'a crate::l7::proposal::HeldProposalInput,
+    ) -> crate::l7::proposal::ProposalSubmission<'a> {
+        Box::pin(async {
+            if self.fail_submission {
+                Err(crate::l7::proposal::ProposalSubmitError::Retryable)
+            } else {
+                Ok("session-review".into())
+            }
+        })
+    }
+
+    fn observe<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> crate::l7::proposal::ProposalObservation<'a> {
+        Box::pin(async {
+            let attempt = self
+                .observations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.recover_observation && attempt > 0 {
+                Ok(crate::l7::proposal::ReviewDecision::Pending)
+            } else {
+                Err(crate::l7::proposal::ProposalSubmitError::Retryable)
+            }
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn gateway_failure_at_deadline_is_unavailable_but_recovery_restores_timeout() {
+    use crate::l7::wait::WaitEnd;
+    for (fail_submission, recover_observation, expected) in [
+        (true, false, WaitEnd::ProposalUnavailable),
+        (false, false, WaitEnd::ProposalUnavailable),
+        (false, true, WaitEnd::Deadline),
+    ] {
+        let engine = std::sync::Arc::new(engine());
+        engine.set_http_hitl_wait_enabled(true);
+        engine.set_http_hitl_wait_limits(std::time::Duration::from_secs(3), 16, 4);
+        engine.attach_http_hitl_policy_observer();
+        engine.set_http_hitl_proposal_service(std::sync::Arc::new(AvailabilityReviewer {
+            fail_submission,
+            recover_observation,
+            observations: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let (_wire, mut session) = approval_session(&engine).await;
+        let start = session.slot().frozen().unwrap().captured_at();
+        assert_eq!(
+            session.wait_for_approval().await,
+            Some(ReviewWaitOutcome::Terminal(expected))
+        );
+        assert_eq!(Instant::now() - start, std::time::Duration::from_secs(3));
+        assert_eq!(session.slot().state(), CaptureState::Terminal);
+        assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+        drop(session);
+        assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
+    }
+}
+
 impl crate::l7::proposal::HeldProposalService for ApprovalReviewer {
     fn submit<'a>(
         &'a self,
