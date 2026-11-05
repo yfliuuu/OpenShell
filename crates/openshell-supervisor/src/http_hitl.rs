@@ -25,6 +25,10 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const ATTEMPT_INTERVAL: Duration = Duration::from_secs(1);
 // Bound the existing all-drafts RPC without adding a new public API. Oversized
 // ledgers fail closed; never accept a truncated response as a complete snapshot.
+// Known limitation: unrelated historical drafts count toward
+// both limits, so ledger growth can prevent an active request from observing its
+// decision. Deferred to avoid changing OpenShell's public API in this patch;
+// these bounds preserve resource limits, not history-independent availability.
 const REVIEW_RESPONSE_BYTES: usize = 256 * 1024;
 const REVIEW_CHUNKS: usize = 1024;
 
