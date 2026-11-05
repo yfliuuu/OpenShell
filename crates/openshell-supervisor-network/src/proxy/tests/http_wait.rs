@@ -137,6 +137,18 @@ async fn serve_held_once<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
     destination: SocketAddr,
     tls: bool,
 ) {
+    serve_held_once_with_credentials(stream, destination, tls, "header-sentinel", None).await;
+}
+
+async fn serve_held_once_with_credentials<
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+>(
+    stream: &mut S,
+    destination: SocketAddr,
+    tls: bool,
+    authorization: &str,
+    api_key: Option<&str>,
+) {
     let mut header = Vec::new();
     while !header.ends_with(b"\r\n\r\n") {
         header.push(stream.read_u8().await.unwrap());
@@ -148,11 +160,18 @@ async fn serve_held_once<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
         Some("GET /missing?secret=query-sentinel HTTP/1.1")
     );
     assert!(header.contains(&format!("Host: {destination}\r\n")));
-    for sentinel in ["query-sentinel", "header-sentinel", "cookie-sentinel"] {
+    for sentinel in ["query-sentinel", "cookie-sentinel"] {
         assert_eq!(header.matches(sentinel).count(), 1);
     }
-    assert!(header.contains("Authorization: header-sentinel\r\n"));
+    assert!(header.contains(&format!("Authorization: {authorization}\r\n")));
+    assert_eq!(header.matches(authorization).count(), 1);
+    assert_eq!(header.matches("Authorization:").count(), 1);
+    if let Some(api_key) = api_key {
+        assert!(header.contains(&format!("X-API-Key: {api_key}\r\n")));
+    }
     assert!(header.contains("Cookie: cookie-sentinel\r\n"));
+    assert!(!header.contains(secrets::PLACEHOLDER_PREFIX_PUBLIC));
+    assert!(!header.contains(secrets::PROVIDER_ALIAS_MARKER_PUBLIC));
     let lower_header = header.to_ascii_lowercase();
     for forbidden in [
         "proxy-authorization:",
@@ -503,6 +522,43 @@ async fn forward_production_ingress_resume_strips_proxy_credentials() {
 }
 
 async fn held_forward_resume_case(proxy_headers: &str, configure_proxy: bool) {
+    held_forward_credential_case(proxy_headers, configure_proxy, None).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeldForwardCredential {
+    Valid,
+    Unknown,
+    EndpointMismatch,
+    Revoked,
+}
+
+#[tokio::test]
+async fn forward_resume_resolves_application_placeholders_and_strips_proxy_headers() {
+    held_forward_credential_case(
+        "Proxy-Authorization: Basic proxy-auth-sentinel\r\nProxy-Connection: keep-alive\r\nProxy-Authenticate: Basic proxy-auth-sentinel\r\nConnection: X-Proxy-Hop\r\nX-Proxy-Hop: proxy-auth-sentinel\r\n",
+        false,
+        Some(HeldForwardCredential::Valid),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn forward_resume_rejects_unknown_mismatched_and_revoked_placeholders() {
+    for credential in [
+        HeldForwardCredential::Unknown,
+        HeldForwardCredential::EndpointMismatch,
+        HeldForwardCredential::Revoked,
+    ] {
+        held_forward_credential_case("", false, Some(credential)).await;
+    }
+}
+
+async fn held_forward_credential_case(
+    proxy_headers: &str,
+    configure_proxy: bool,
+    credential: Option<HeldForwardCredential>,
+) {
     let Some(ip) = non_loopback_test_ipv4() else {
         eprintln!("skipping FORWARD resume fixture: no routable local test address");
         return;
@@ -510,6 +566,50 @@ async fn held_forward_resume_case(proxy_headers: &str, configure_proxy: bool) {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let upstream = TcpListener::bind((ip, 0)).await.unwrap();
         let destination = upstream.local_addr().unwrap();
+        let credentials = credential.map(|kind| {
+            use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+            ProviderCredentialState::from_bound_environment(
+                1,
+                std::collections::HashMap::from([("API_KEY".into(), "held-fixture-token".into())]),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::from([(
+                    "API_KEY".into(),
+                    StaticCredentialBinding {
+                        credential_identity: "held-fixture:API_KEY".into(),
+                        workload_credential_handle: String::new(),
+                        endpoints: vec![StaticCredentialEndpointBinding {
+                            host: ip.to_string(),
+                            port: u32::from(destination.port()),
+                            path: if kind == HeldForwardCredential::EndpointMismatch {
+                                "/other".into()
+                            } else {
+                                "/missing".into()
+                            },
+                        }],
+                    },
+                )]),
+                Vec::new(),
+            )
+            .unwrap()
+        });
+        let placeholder = credentials.as_ref().map(|state| {
+            if credential == Some(HeldForwardCredential::Unknown) {
+                "openshell:resolve:env:MISSING_KEY".to_owned()
+            } else {
+                state.snapshot().child_env["API_KEY"].clone()
+            }
+        });
+        let authorization = placeholder.as_ref().map_or_else(
+            || "header-sentinel".to_owned(),
+            |placeholder| format!("Bearer {placeholder}"),
+        );
+        let application_headers = placeholder.as_ref().map_or_else(String::new, |placeholder| {
+            format!(
+                "X-API-Key: provider-OPENSHELL-RESOLVE-ENV-{}\r\n",
+                placeholder.strip_prefix(secrets::PLACEHOLDER_PREFIX_PUBLIC).unwrap()
+            )
+        });
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_proxy = UpstreamProxyConfig::from_args(&upstream_proxy::UpstreamProxyArgs {
             https_proxy: configure_proxy
@@ -538,7 +638,7 @@ async fn held_forward_resume_case(proxy_headers: &str, configure_proxy: bool) {
         };
         let (client, mut wire) = tokio::io::duplex(8192);
         let request = format!(
-            "GET http://{destination}/a/../missing?secret=query-sentinel HTTP/1.1\r\nHost: {destination}\r\nAuthorization: header-sentinel\r\nCookie: cookie-sentinel\r\n{proxy_headers}\r\n"
+            "GET http://{destination}/a/../missing?secret=query-sentinel HTTP/1.1\r\nHost: {destination}\r\nAuthorization: {authorization}\r\nCookie: cookie-sentinel\r\n{application_headers}{proxy_headers}\r\n"
         );
         let handler = Box::pin(handle_mediated_connection(
             tokio::io::BufReader::new(Box::new(client)),
@@ -555,7 +655,7 @@ async fn held_forward_resume_case(proxy_headers: &str, configure_proxy: bool) {
             Arc::new(None),
             Arc::new(None),
             Arc::new(upstream_proxy),
-            None,
+            credentials.clone(),
             None,
             None,
             None,
@@ -587,6 +687,15 @@ async fn held_forward_resume_case(proxy_headers: &str, configure_proxy: bool) {
         assert_no_held_dial(&upstream).await;
         // Coverage alone is not approval. Observe the installed rule while
         // the deterministic reviewer still reports Pending.
+        // First verify the converse: approval cannot release an uncovered
+        // request or prepare application credentials for forwarding.
+        recorder.decision.store(1, Ordering::Release);
+        engine.reload(include_str!("../../../data/sandbox-policy.rego"), &data).unwrap();
+        let observations = recorder.observations.load(Ordering::Acquire);
+        drive_held_until(handler.as_mut(), || recorder.observations.load(Ordering::Acquire) > observations).await;
+        assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+        assert_no_held_dial(&upstream).await;
+        recorder.decision.store(0, Ordering::Release);
         engine
             .reload(
                 include_str!("../../../data/sandbox-policy.rego"),
@@ -597,6 +706,9 @@ async fn held_forward_resume_case(proxy_headers: &str, configure_proxy: bool) {
         drive_held_until(handler.as_mut(), || recorder.observations.load(Ordering::Acquire) > observations).await;
         assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
         assert_no_held_dial(&upstream).await;
+        if credential == Some(HeldForwardCredential::Revoked) {
+            credentials.as_ref().unwrap().revoke_static_provider_environment(2);
+        }
         recorder.decision.store(1, Ordering::Release);
         // Wake observation without relying on wall-clock polling latency.
         engine.reload(include_str!("../../../data/sandbox-policy.rego"), &data.replace("path: /allowed", "path: /missing")).unwrap();
@@ -605,10 +717,42 @@ async fn held_forward_resume_case(proxy_headers: &str, configure_proxy: bool) {
                 accepted = upstream.accept() => accepted.unwrap(),
                 _ = proxy_listener.accept() => panic!("FORWARD must retain native direct routing"),
             };
-            serve_held_once(&mut fresh, destination, false).await;
+            if credential.is_some_and(|kind| kind != HeldForwardCredential::Valid) {
+                assert!(read_held_close(&mut fresh, false).await.is_empty(),
+                    "unresolved application credentials must not release upstream bytes");
+            } else {
+                let authorization = if credential.is_some() {
+                    "Bearer held-fixture-token"
+                } else {
+                    "header-sentinel"
+                };
+                serve_held_once_with_credentials(
+                    &mut fresh,
+                    destination,
+                    false,
+                    authorization,
+                    credential.map(|_| "held-fixture-token"),
+                ).await;
+            }
         };
         let client = async {
-            assert_eq!(read_held_close(&mut wire, false).await, HELD_RESPONSE);
+            let response = read_held_close(&mut wire, false).await;
+            if credential.is_some_and(|kind| kind != HeldForwardCredential::Valid) {
+                let (status, error) = if credential == Some(HeldForwardCredential::EndpointMismatch) {
+                    ("HTTP/1.1 403 Forbidden\r\n", "credential_endpoint_mismatch")
+                } else {
+                    ("HTTP/1.1 500 Internal Server Error\r\n", "credential_unavailable")
+                };
+                assert!(response.starts_with(status.as_bytes()),
+                    "credential refusal must fail closed through the native relay");
+                let body = response.windows(4).position(|bytes| bytes == b"\r\n\r\n").unwrap() + 4;
+                let body: serde_json::Value = serde_json::from_slice(&response[body..]).unwrap();
+                assert_eq!(body["error"], error);
+                assert!(!String::from_utf8_lossy(&response).contains("held-fixture-token"));
+                assert!(!String::from_utf8_lossy(&response).contains("API_KEY"));
+            } else {
+                assert_eq!(response, HELD_RESPONSE);
+            }
         };
         let (result, (), ()) = tokio::join!(handler, server, client);
         result.unwrap();

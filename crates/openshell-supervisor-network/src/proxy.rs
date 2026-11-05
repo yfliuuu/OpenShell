@@ -5059,15 +5059,62 @@ fn rewrite_forward_request(
     canonical_authority: &str,
     secret_resolver: Option<&SecretResolver>,
 ) -> Result<Vec<u8>, secrets::UnresolvedPlaceholderError> {
+    let upstream_path = match secret_resolver {
+        Some(resolver) => secrets::rewrite_target_for_eval(path, resolver)?.resolved,
+        None => path.to_string(),
+    };
+    let output =
+        rewrite_forward_request_head(raw, used, &upstream_path, canonical_authority, |line| {
+            secret_resolver.map_or_else(
+                || Ok(line.to_owned()),
+                |resolver| rewrite_header_line_checked(line, resolver),
+            )
+        })?;
+    // Final FORWARD rewriting is a credential boundary, even without a
+    // resolver. Only headers are owned here; body overflow stays guarded by
+    // the native relay's body classification/rewrite path.
+    let header_end = output
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .map_or(output.len(), |position| position + 4);
+    let output_str = String::from_utf8_lossy(&output[..header_end]);
+    if output_str.contains(secrets::PLACEHOLDER_PREFIX_PUBLIC)
+        || output_str.contains(secrets::PROVIDER_ALIAS_MARKER_PUBLIC)
+    {
+        return Err(secrets::UnresolvedPlaceholderError::unavailable("header"));
+    }
+    Ok(output)
+}
+
+/// Prepare an origin-form copy without acquiring or resolving credentials.
+/// Application placeholders survive until fresh admission and native relay
+/// preparation; this is not the final unresolved-placeholder boundary.
+fn sanitize_forward_request(
+    raw: &[u8],
+    used: usize,
+    path: &str,
+    canonical_authority: &str,
+) -> Result<Vec<u8>, secrets::UnresolvedPlaceholderError> {
+    rewrite_forward_request_head(raw, used, path, canonical_authority, |line| {
+        Ok(line.to_owned())
+    })
+}
+
+/// Share wire sanitization while keeping credential work caller-controlled.
+/// The header rewriter runs only on retained application fields, never on
+/// stripped proxy fields or the reconstructed authority/hop-by-hop fields.
+fn rewrite_forward_request_head(
+    raw: &[u8],
+    used: usize,
+    path: &str,
+    canonical_authority: &str,
+    rewrite_header: impl Fn(&str) -> Result<String, secrets::UnresolvedPlaceholderError>,
+) -> Result<Vec<u8>, secrets::UnresolvedPlaceholderError> {
     let header_end = raw[..used]
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(used, |p| p + 4);
     let websocket_upgrade = crate::l7::rest::request_is_websocket_upgrade(&raw[..header_end]);
-    let upstream_path = match secret_resolver {
-        Some(resolver) => secrets::rewrite_target_for_eval(path, resolver)?.resolved,
-        None => path.to_string(),
-    };
 
     let header_str = String::from_utf8_lossy(&raw[..header_end]);
     let lines = header_str.split("\r\n").collect::<Vec<_>>();
@@ -5092,7 +5139,7 @@ fn rewrite_forward_request(
             if parts.len() == 3 {
                 output.extend_from_slice(parts[0].as_bytes());
                 output.push(b' ');
-                output.extend_from_slice(upstream_path.as_bytes());
+                output.extend_from_slice(path.as_bytes());
                 output.push(b' ');
                 output.extend_from_slice(parts[2].as_bytes());
             } else {
@@ -5134,10 +5181,7 @@ fn rewrite_forward_request(
             continue;
         }
 
-        let rewritten_line = match secret_resolver {
-            Some(resolver) => rewrite_header_line_checked(line, resolver)?,
-            None => line.to_string(),
-        };
+        let rewritten_line = rewrite_header(line)?;
 
         output.extend_from_slice(rewritten_line.as_bytes());
         output.extend_from_slice(b"\r\n");
@@ -5165,7 +5209,6 @@ fn rewrite_forward_request(
 
     // End of headers
     output.extend_from_slice(b"\r\n");
-    let rewritten_header_end = output.len();
 
     // Append only bytes that belong to the first request body. The initial
     // proxy read can also contain a pipelined follow-on request; forwarding
@@ -5174,16 +5217,6 @@ fn rewrite_forward_request(
         let overflow = &raw[header_end..used];
         let body_prefix_len = initial_forward_body_prefix_len(&header_str, overflow);
         output.extend_from_slice(&overflow[..body_prefix_len]);
-    }
-
-    // Header resolution only owns headers. Body bytes from the initial read
-    // must reach the same guarded relay as bytes read later, regardless of
-    // whether that relay classifies literal text or explicitly rewrites it.
-    let output_str = String::from_utf8_lossy(&output[..rewritten_header_end]);
-    if output_str.contains(secrets::PLACEHOLDER_PREFIX_PUBLIC)
-        || output_str.contains(secrets::PROVIDER_ALIAS_MARKER_PUBLIC)
-    {
-        return Err(secrets::UnresolvedPlaceholderError::unavailable("header"));
     }
 
     Ok(output)
@@ -13908,6 +13941,29 @@ network_policies:
             ),
             "outbound request line must preserve canonical query, got: {rewritten_str:?}"
         );
+    }
+
+    #[test]
+    fn test_rewrite_without_resolver_still_rejects_application_placeholders() {
+        for marker in [
+            "openshell:resolve:env:API_KEY",
+            "provider-OPENSHELL-RESOLVE-ENV-API_KEY",
+        ] {
+            for in_target in [false, true] {
+                let (path, authorization) = if in_target {
+                    (format!("/p?token={marker}"), "literal-business-value")
+                } else {
+                    ("/p".to_owned(), marker)
+                };
+                let raw = format!(
+                    "GET http://host{path} HTTP/1.1\r\nHost: host\r\nAuthorization: {authorization}\r\n\r\n"
+                );
+                assert!(
+                    rewrite_forward_request(raw.as_bytes(), raw.len(), &path, "host", None)
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[test]

@@ -77,6 +77,48 @@ fn forward_mode_sanitizes_both_target_forms_without_mutating_frozen_request() {
 }
 
 #[test]
+fn forward_preparation_preserves_application_placeholders_until_admission() {
+    for target in ["/missing?x=%2f", "http://example.com/missing?x=%2f"] {
+        let raw = format!(
+            "GET {target} HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer openshell:resolve:env:API_KEY\r\nX-API-Key: provider-OPENSHELL-RESOLVE-ENV-API_KEY\r\nProxy-Authorization: Basic proxy-auth-sentinel\r\nProxy-Connection: keep-alive\r\nProxy-Authenticate: Basic proxy-auth-sentinel\r\nConnection: X-Proxy-Hop\r\nX-Proxy-Hop: proxy-auth-sentinel\r\n\r\n"
+        );
+        let frozen = crate::l7::rest::request_from_buffered_http(
+            "GET",
+            "/missing",
+            "/missing?x=%2f",
+            raw.as_bytes().to_vec(),
+        )
+        .unwrap();
+        let outgoing = prepare_outgoing_request(&frozen, HeldProxyMode::Forward, "example.com", 80)
+            .expect("sanitization must defer application credential resolution");
+        let header = std::str::from_utf8(&outgoing.raw_header).unwrap();
+        assert!(header.starts_with("GET /missing?x=%2f HTTP/1.1\r\n"));
+        assert!(header.contains("Authorization: Bearer openshell:resolve:env:API_KEY\r\n"));
+        assert!(header.contains("X-API-Key: provider-OPENSHELL-RESOLVE-ENV-API_KEY\r\n"));
+        assert!(!header.to_ascii_lowercase().contains("proxy-auth"));
+        assert!(!header.to_ascii_lowercase().contains("proxy-connection:"));
+        assert!(!header.to_ascii_lowercase().contains("x-proxy-hop:"));
+        assert_eq!(frozen.raw_header, raw.as_bytes());
+        assert_eq!(outgoing.action, frozen.action);
+        assert_eq!(outgoing.target, frozen.target);
+        assert_eq!(outgoing.query_params, frozen.query_params);
+        assert_eq!(outgoing.body_length, frozen.body_length);
+        // Ordinary final FORWARD rewriting must still reject both marker forms
+        // without a resolver; the held preparation is not that final boundary.
+        assert!(
+            rewrite_forward_request(
+                &outgoing.raw_header,
+                outgoing.raw_header.len(),
+                "/missing?x=%2f",
+                "example.com",
+                None,
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn connect_mode_does_not_infer_forward_from_absolute_target() {
     for target in ["/missing?x=%2f", "http://example.com/missing?x=%2f"] {
         let raw = format!(

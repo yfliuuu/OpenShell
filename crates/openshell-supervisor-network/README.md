@@ -75,6 +75,9 @@ and flushes, including re-polls.
 Middleware cannot change the frozen method/path/query/request line or add a body.
 FORWARD derives a native origin-form outgoing copy without losing the query;
 the frozen original is never mutated.
+This preparation strips proxy-only headers without resolving application
+credential placeholders. Only the admitted native relay resolves them;
+unresolved placeholders still fail closed before upstream application writes.
 
 `ApplicationFence` wraps the application stream **after** fresh upstream TLS.
 Every `poll_write`, `poll_flush` and `poll_shutdown`, including Pending re-polls, checks policy,

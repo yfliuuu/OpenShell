@@ -192,19 +192,19 @@ fn prepare_outgoing_request(
             "HTTP/1.1",
         )?,
         HeldProxyMode::Forward => {
-            // Reuse native FORWARD sanitization even if a parser already made
-            // the target origin-form. Live credentials are prepared later,
-            // only after fresh admission in relay_held_rest_once.
+            // Sanitize even if a parser already made the target origin-form,
+            // but preserve application credential placeholders. Resolution
+            // and final rejection belong after fresh admission in the native
+            // relay_held_rest_once path, not this outgoing-copy preparation.
             let upstream_target = match query.as_deref() {
                 Some(query) if !query.is_empty() => format!("{}?{query}", canonical.path),
                 _ => canonical.path,
             };
-            rewrite_forward_request(
+            sanitize_forward_request(
                 &request.raw_header,
                 request.raw_header.len(),
                 &upstream_target,
                 &canonical_forward_authority(host, port),
-                None,
             )
             .map_err(miette::Report::new)?
         }
