@@ -1543,23 +1543,23 @@ pub fn apply_http_hitl_classification_setting(
         openshell_core::settings::HTTP_HITL_WAIT_TIMEOUT_SECONDS_KEY,
     )
     .unwrap_or(300)
-    .clamp(1, 300) as u64;
+    .clamp(1, 300);
     let sandbox_limit = extract_int_setting(
         settings,
         openshell_core::settings::HTTP_HITL_WAIT_SANDBOX_LIMIT_KEY,
     )
     .unwrap_or(16)
-    .clamp(1, 16) as usize;
+    .clamp(1, 16);
     let destination_limit = extract_int_setting(
         settings,
         openshell_core::settings::HTTP_HITL_WAIT_DESTINATION_LIMIT_KEY,
     )
     .unwrap_or(4)
-    .clamp(1, 4) as usize;
+    .clamp(1, 4);
     engine.set_http_hitl_wait_limits(
-        Duration::from_secs(timeout_seconds),
-        sandbox_limit,
-        destination_limit,
+        Duration::from_secs(u64::try_from(timeout_seconds).expect("clamped timeout fits u64")),
+        usize::try_from(sandbox_limit).expect("clamped sandbox limit fits usize"),
+        usize::try_from(destination_limit).expect("clamped destination limit fits usize"),
     );
 }
 

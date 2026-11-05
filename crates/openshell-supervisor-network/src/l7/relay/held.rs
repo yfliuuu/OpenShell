@@ -10,11 +10,12 @@
 use super::{
     L7EvalContext, credential_generation_guard, http_response_middleware_relay,
     prepare_inspected_request, reject_credential_resolution, reject_request_authority_mismatch,
-    relay_http_request_with_credential_rejection_observed, request_authority_matches_endpoint,
+    relay_http_request_with_body_observed, request_authority_matches_endpoint,
     request_default_port, transformed_body_validator, write_bad_gateway_response,
 };
 use crate::l7::middleware::{
-    MiddlewareApplyResult, apply_middleware_chain_with_request_id, middleware_network_input,
+    MiddlewareApplyResult, RequestBodyDelivery,
+    apply_middleware_chain_with_request_id_and_delivery, middleware_network_input,
 };
 use crate::l7::provider::{BodyLength, L7Request, RelayOutcome};
 use crate::l7::rest::{CredentialGenerationGuard, WebSocketExtensionMode};
@@ -104,7 +105,7 @@ where
         }
         native_validate(body)
     };
-    let request = match apply_middleware_chain_with_request_id(
+    let middleware_result = apply_middleware_chain_with_request_id_and_delivery(
         request,
         client,
         ctx,
@@ -113,9 +114,12 @@ where
         engine.generation_guard(),
         openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
         request_id,
+        // Finish any HTTP hook before forwarding; held requests cannot stream
+        // or acquire a body, including one produced by middleware.
+        RequestBodyDelivery::Withhold { max_bytes: 0 },
     )
-    .await?
-    {
+    .await?;
+    let request = match middleware_result {
         MiddlewareApplyResult::Allowed(request) => request,
         result => {
             let denied = L7Request {
@@ -126,12 +130,13 @@ where
                 body_length: BodyLength::None,
             };
             return match result {
-                MiddlewareApplyResult::Denied { denial } => {
+                MiddlewareApplyResult::Denied { denial, failure } => {
                     crate::l7::middleware::send_middleware_rejection_response(
                         &denied,
                         client,
                         ctx,
                         denial.as_ref(),
+                        failure.as_ref(),
                         &redacted_target,
                     )
                     .await
@@ -144,6 +149,21 @@ where
                         &redacted_target,
                     )
                     .await
+                }
+                MiddlewareApplyResult::RequestTimeout => {
+                    // Do not use the ordinary early-response helper: it drains
+                    // client input, which this one-shot held relay must not read.
+                    crate::l7::rest::send_request_timeout_response(
+                        &denied,
+                        &ctx.policy_name,
+                        client,
+                        Some(&redacted_target),
+                        Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
+                    )
+                    .await
+                }
+                MiddlewareApplyResult::Streamed { .. } => {
+                    Err(miette!("held REST middleware must not stream a body"))
                 }
                 MiddlewareApplyResult::Allowed(_) => unreachable!(),
             };
@@ -165,7 +185,11 @@ where
         .as_ref()
         .filter(|_| ctx.token_grant_resolver.is_some())
         .and_then(EndpointObservationSender::capture);
-    let (request, prepared_ctx) = match prepare_inspected_request(
+    // Response middleware must see the forwarded head before grant injection.
+    let request_head = crate::l7::middleware::ForwardedRequestHead::of(&request, None);
+    // Grants are already applied to the returned request. There is no streamed
+    // body or later head mutation requiring the separate reapplication payload.
+    let (request, prepared_ctx, _injected) = match prepare_inspected_request(
         request,
         ctx,
         engine,
@@ -208,7 +232,7 @@ where
         ctx.provider_credential_revision,
         Some(engine.generation_guard()),
     );
-    let outcome = relay_http_request_with_credential_rejection_observed(
+    let outcome = Box::pin(relay_http_request_with_body_observed(
         &request,
         client,
         &mut guarded,
@@ -222,6 +246,7 @@ where
             request_body_credential_rewrite: config.request_body_credential_rewrite,
             deny_uninspected_credentials: config
                 .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
+            identity_response_coding: false,
             credential_signing: config.credential_signing,
             signing_service: &config.signing_service,
             signing_region: &config.signing_region,
@@ -229,8 +254,10 @@ where
             port: ctx.port,
         },
         ctx,
+        None,
         Some(http_response_middleware_relay(
             &request,
+            request_head,
             ctx,
             ctx.request_scheme(),
             request_id,
@@ -239,7 +266,7 @@ where
             Some(engine.generation_guard()),
         )),
         observer.as_ref(),
-    )
+    ))
     .await?;
     match outcome {
         None | Some(RelayOutcome::Reusable | RelayOutcome::Consumed) => Ok(()),
@@ -397,6 +424,7 @@ network_policies:
       - host: api.example.test
         port: 8080
         protocol: rest
+        token_grant_owner: held_api
         enforcement: enforce
         rules:
           - allow:
@@ -627,6 +655,59 @@ network_policies:
                 .poll_read(&mut Context::from_waker(Waker::noop()), &mut read_buf)
                 .is_pending()
         );
+    }
+
+    #[tokio::test]
+    async fn bodyless_relay_preserves_injected_token_grant_without_client_reads() {
+        let (_engine, tunnel, config, mut ctx) = fixture();
+        let key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
+        let grant = crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::success(
+            key,
+            "held-grant-token",
+        );
+        grant
+            .dynamic_credentials()
+            .write()
+            .unwrap()
+            .get_mut(key)
+            .unwrap()
+            .token_grant_owners = vec!["held_api".to_string()];
+        ctx.provider_credentials = Some(grant.provider_credentials());
+        ctx.token_grant_resolver = Some(grant.resolver());
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let mut client = NoClientReads(client);
+        let (mut upstream, mut server) = tokio::io::duplex(8192);
+        let response = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let relay = relay_held_rest_once(
+                request("/v1/items"),
+                &mut client,
+                &mut upstream,
+                &ctx,
+                &tunnel,
+                &config,
+                "held-grant",
+            );
+            let exchange = async {
+                let mut received = Vec::new();
+                while !received.ends_with(b"\r\n\r\n") {
+                    received.push(server.read_u8().await.unwrap());
+                }
+                let head = String::from_utf8(received).unwrap().to_ascii_lowercase();
+                assert!(head.contains("authorization: bearer held-grant-token\r\n"));
+                server.write_all(response).await.unwrap();
+                server.flush().await.unwrap();
+            };
+            let (result, ()) = tokio::join!(relay, exchange);
+            result.unwrap();
+        })
+        .await
+        .unwrap();
+        grant.assert_one_request(key);
+        assert_eq!(grant.requested_ids(), ["held-grant"]);
+        let mut output = vec![0; response.len()];
+        peer.read_exact(&mut output).await.unwrap();
+        assert_eq!(output, response);
     }
 
     #[test]

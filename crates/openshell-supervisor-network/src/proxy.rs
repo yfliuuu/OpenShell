@@ -6186,12 +6186,7 @@ async fn handle_forward_proxy_in_slot(
 
         if effectively_denied
             && !force_deny
-            && crate::l7::relay::should_begin_wait_for_review(
-                &tunnel_engine,
-                slot,
-                &host_lc,
-                port,
-            )
+            && crate::l7::relay::should_begin_wait_for_review(&tunnel_engine, slot, &host_lc, port)
         {
             return Ok(());
         }

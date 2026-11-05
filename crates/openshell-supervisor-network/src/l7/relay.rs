@@ -12271,9 +12271,10 @@ network_policies:
                 relay_rest(
                     &config,
                     &tunnel_engine,
-                    &mut relay_client,
+                    &mut tokio::io::BufReader::new(&mut relay_client),
                     &mut relay_upstream,
                     &ctx,
+                    &mut RequestSlot::new(),
                 )
                 .await
             });
@@ -12462,9 +12463,10 @@ network_policies:
                 relay_rest(
                     &config,
                     &tunnel_engine,
-                    &mut relay_client,
+                    &mut tokio::io::BufReader::new(&mut relay_client),
                     &mut relay_upstream,
                     &ctx,
+                    &mut RequestSlot::new(),
                 )
                 .await
             });
@@ -12747,9 +12749,10 @@ network_policies:
                 relay_rest(
                     &config,
                     &tunnel_engine,
-                    &mut relay_client,
+                    &mut tokio::io::BufReader::new(&mut relay_client),
                     &mut relay_upstream,
                     &ctx,
+                    &mut RequestSlot::new(),
                 )
                 .await
             });
