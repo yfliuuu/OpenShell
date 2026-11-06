@@ -223,6 +223,8 @@ Ordinary custom headers can differ between rules. Protected headers such as `Aut
 
 The maximum order makes this the last request middleware. Dynamic token grants targeting a rule's header on potentially overlapping host/port/path scopes prevent supervisor activation. Other headers or disjoint scopes can coexist. Legacy configurations retain host-wide conflict checks.
 
+This handler uses the legacy request middleware protocol. Its host selector must not overlap newer HTTP-hook request middleware; the gateway rejects mixed request-hook versions. Newer response-only HTTP-hook middleware can still select the same hosts.
+
 Keep the attachment outside provider-generated policy so detaching a provider cannot remove enforcement. After detachment or revocation activates, requests selecting that provider fail closed until an authorized replacement becomes available; other rules can continue using their own credentials. Rotation applies to subsequent requests on existing connections. Requests prepared with a replaced installation or an expired credential cannot dispatch.
 
 The request body limit is 256 KiB. Existing buffering and inspected HTTP protocol limitations still apply. The service must treat this header as authoritative and must not expose the credential in responses. Refer to the [implementation and verification guide](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-supervisor-middleware-builtins/README.md) for build instructions.

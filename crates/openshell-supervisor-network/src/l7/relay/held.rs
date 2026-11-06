@@ -412,9 +412,15 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for HeldUpstream<'_, U> {
 mod tests {
     use super::*;
     use crate::opa::{NetworkInput, OpaEngine};
+    use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
     use openshell_core::provider_credentials::ProviderCredentialState;
+    use openshell_supervisor_middleware::{
+        HttpRequestView, InProcessMiddleware, LocalHttpRequestResult, MiddlewareRegistry,
+    };
+    use openshell_supervisor_middleware_builtins::mandatory_auth::MandatoryAuthService;
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::task::Waker;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -443,7 +449,18 @@ network_policies:
         L7EndpointConfig,
         L7EvalContext,
     ) {
-        let engine = OpaEngine::from_strings(POLICY, DATA).unwrap();
+        fixture_with_data(DATA)
+    }
+
+    fn fixture_with_data(
+        data: &str,
+    ) -> (
+        OpaEngine,
+        TunnelPolicyEngine,
+        L7EndpointConfig,
+        L7EvalContext,
+    ) {
+        let engine = OpaEngine::from_strings(POLICY, data).unwrap();
         let input = NetworkInput {
             host: "api.example.test".into(),
             port: 8080,
@@ -466,6 +483,130 @@ network_policies:
             ..Default::default()
         };
         (engine, tunnel, config, ctx)
+    }
+
+    fn mandatory_bindings() -> HashMap<String, StaticCredentialBinding> {
+        HashMap::from([(
+            "SERVICE_TOKEN".into(),
+            StaticCredentialBinding {
+                credential_identity: "provider:SERVICE_TOKEN".into(),
+                endpoints: vec![StaticCredentialEndpointBinding {
+                    host: "api.example.test".into(),
+                    port: 8080,
+                    path: "/v1/**".into(),
+                }],
+                ..Default::default()
+            },
+        )])
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum CredentialTransition {
+        Unchanged,
+        Replaced(u64),
+        Revoked,
+    }
+
+    struct TransitioningMandatoryAuth {
+        service: MandatoryAuthService,
+        credentials: ProviderCredentialState,
+        transition: CredentialTransition,
+    }
+
+    #[tonic::async_trait]
+    impl InProcessMiddleware for TransitioningMandatoryAuth {
+        fn requires_credential_provenance(&self) -> bool {
+            true
+        }
+
+        async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+            self.service.describe().await
+        }
+
+        async fn validate_config(&self, name: &str, config: &prost_types::Struct) -> Result<()> {
+            self.service.validate_config(name, config).await
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            request: HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            self.service.evaluate_http_request(request).await
+        }
+
+        async fn evaluate_http_request_local(
+            &self,
+            request: HttpRequestView<'_>,
+        ) -> Result<LocalHttpRequestResult> {
+            let result = self.service.evaluate_http_request_local(request).await?;
+            match self.transition {
+                CredentialTransition::Unchanged => {}
+                CredentialTransition::Replaced(revision) => {
+                    self.credentials
+                        .install_bound_environment(
+                            revision,
+                            HashMap::from([(
+                                "SERVICE_TOKEN".into(),
+                                "synthetic-replacement".into(),
+                            )]),
+                            HashMap::new(),
+                            HashMap::new(),
+                            mandatory_bindings(),
+                            Vec::new(),
+                        )
+                        .unwrap();
+                }
+                CredentialTransition::Revoked => {
+                    self.credentials.revoke_static_provider_environment(2);
+                }
+            }
+            Ok(result)
+        }
+    }
+
+    async fn mandatory_fixture(
+        transition: CredentialTransition,
+    ) -> (
+        OpaEngine,
+        TunnelPolicyEngine,
+        L7EndpointConfig,
+        L7EvalContext,
+        ProviderCredentialState,
+    ) {
+        let data = format!(
+            "{DATA}\nnetwork_middlewares:\n  mandatory:\n    middleware: agent-guardrails/mandatory-auth\n    order: 2147483647\n    on_error: fail_closed\n    endpoints:\n      include: [api.example.test]\n    config:\n      credential_env: SERVICE_TOKEN\n      header_name: X-Service-ID\n"
+        );
+        let (engine, _, config, mut ctx) = fixture_with_data(&data);
+        let credentials = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("SERVICE_TOKEN".into(), "synthetic-original".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            mandatory_bindings(),
+            Vec::new(),
+        )
+        .unwrap();
+        let mut event_context = openshell_ocsf::ctx::ctx().clone();
+        event_context.sandbox_id = "held-mandatory-auth".into();
+        let _ = openshell_ocsf::ctx::set_ctx(event_context);
+        let sandbox_id = openshell_ocsf::ctx::ctx().sandbox_id.clone();
+        let registry = MiddlewareRegistry::connect_services(
+            vec![Arc::new(TransitioningMandatoryAuth {
+                service: MandatoryAuthService::for_sandbox(sandbox_id, credentials.clone())
+                    .unwrap(),
+                credentials: credentials.clone(),
+                transition,
+            })],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        engine.replace_middleware_registry(registry).unwrap();
+        let tunnel = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        ctx.provider_credentials = Some(credentials.clone());
+        (engine, tunnel, config, ctx, credentials)
     }
 
     fn request(target: &str) -> L7Request {
@@ -658,6 +799,107 @@ network_policies:
                 .poll_read(&mut Context::from_waker(Waker::noop()), &mut read_buf)
                 .is_pending()
         );
+    }
+
+    #[tokio::test]
+    async fn mandatory_auth_held_request_resolves_current_credential_after_approval() {
+        let (_engine, tunnel, config, ctx, credentials) =
+            mandatory_fixture(CredentialTransition::Unchanged).await;
+        let mut frozen = request("/v1/items");
+        frozen.raw_header = b"GET /v1/items HTTP/1.1\r\nHost: api.example.test:8080\r\nX-Service-ID: synthetic-other\r\nx-service-id: openshell:resolve:env:UNKNOWN\r\n\r\n".to_vec();
+        credentials
+            .install_bound_environment(
+                2,
+                HashMap::from([("SERVICE_TOKEN".into(), "synthetic-rotated".into())]),
+                HashMap::new(),
+                HashMap::new(),
+                mandatory_bindings(),
+                Vec::new(),
+            )
+            .unwrap();
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let mut client = NoClientReads(client);
+        let (mut upstream, mut server) = tokio::io::duplex(8192);
+        let response = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let relay = relay_held_rest_once(
+                frozen,
+                &mut client,
+                &mut upstream,
+                &ctx,
+                &tunnel,
+                &config,
+                "held-mandatory-current",
+            );
+            let exchange = async {
+                let mut received = Vec::new();
+                while !received.ends_with(b"\r\n\r\n") {
+                    received.push(server.read_u8().await.unwrap());
+                }
+                let head = String::from_utf8(received).unwrap();
+                let values: Vec<_> = head
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("x-service-id"))
+                    .map(|(_, value)| value.trim())
+                    .collect();
+                assert_eq!(values, ["synthetic-rotated"]);
+                server.write_all(response).await.unwrap();
+            };
+            let (result, ()) = tokio::join!(relay, exchange);
+            result.unwrap();
+        })
+        .await
+        .unwrap();
+        let mut output = vec![0; response.len()];
+        peer.read_exact(&mut output).await.unwrap();
+        assert_eq!(output, response);
+    }
+
+    #[tokio::test]
+    async fn mandatory_auth_held_request_preserves_originating_provenance() {
+        for transition in [
+            CredentialTransition::Replaced(1),
+            CredentialTransition::Replaced(2),
+            CredentialTransition::Revoked,
+        ] {
+            let (_engine, tunnel, config, ctx, _credentials) = mandatory_fixture(transition).await;
+            let (client, mut peer) = tokio::io::duplex(8192);
+            let mut client = NoClientReads(client);
+            let (mut upstream, mut server) = tokio::io::duplex(8192);
+            server
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                relay_held_rest_once(
+                    request("/v1/items"),
+                    &mut client,
+                    &mut upstream,
+                    &ctx,
+                    &tunnel,
+                    &config,
+                    "held-mandatory-stale",
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let mut output = [0; 8192];
+            let count = peer.read(&mut output).await.unwrap();
+            assert!(
+                output[..count].starts_with(b"HTTP/1.1 502"),
+                "{transition:?}"
+            );
+            drop(upstream);
+            let mut received = Vec::new();
+            server.read_to_end(&mut received).await.unwrap();
+            assert!(
+                received.is_empty(),
+                "{transition:?} must not reach upstream"
+            );
+        }
     }
 
     #[tokio::test]

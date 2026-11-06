@@ -2113,6 +2113,7 @@ mod tests {
             sandbox_id: "sandbox-test".into(),
             sandbox_name: "sandbox-test".into(),
             workspace: "workspace".into(),
+            originating_process: None,
             scheme: "https".into(),
             host: "tools.example.com".into(),
             port: 443,

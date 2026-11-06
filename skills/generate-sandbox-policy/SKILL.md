@@ -232,7 +232,7 @@ Add `network_middlewares` only when the user asks to inspect, transform, redact,
 - WebSocket middleware inspects client text messages only, over both `ws://` and `wss://`. Binary and upstream-to-client messages pass without inspection, even with `fail_closed`.
 - `on_error` controls selected-stage failures. Explicit denials always block traffic. A failed WebSocket stage with `fail_open` can remain bypassed for the rest of the connection.
 - Default `on_error` to `fail_closed`. Use `fail_open` only when bypassing the stage preserves the user's stated security requirement. Never use `fail_open` for a service that implements HTTP hooks; the gateway rejects it.
-- Entries whose endpoint selectors may overlap must use the same HTTP hook version for the operations both handle. The built-in `openshell/regex` uses legacy HTTP hooks, so do not let its selector overlap an HTTP hook service that inspects requests.
+- Entries whose endpoint selectors may overlap must use the same HTTP hook version for the operations both handle. The built-ins `openshell/regex` and `agent-guardrails/mandatory-auth` use legacy request hooks, so do not let their selectors overlap a newer HTTP hook service that inspects requests. Response-only HTTP hooks can select the same hosts.
 - Assign unique `order` values across the complete policy. Lower values run first, and at most 10 configs may be selected.
 - Match the narrowest destination hosts possible with `endpoints.include`; use `exclude` when a broad selector has trusted exceptions.
 - Do not select fail-closed middleware for `tls: skip` endpoints because the supervisor cannot inspect that traffic.

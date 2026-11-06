@@ -20,6 +20,11 @@ registration. Compilation makes the handler available, but only a sandbox
 policy attachment activates enforcement. It requires gateway-managed sandbox
 configuration, not standalone proxy or local policy-file mode.
 
+The handler uses legacy `HTTP_REQUEST/PRE_CREDENTIALS` evaluation, not the newer
+streaming request-hook protocol. Keep its host selector disjoint from newer
+HTTP-hook request middleware; mixed request-hook versions are rejected.
+Response-only HTTP-hook middleware can select the same hosts.
+
 Builds using `--no-default-features` must select `mandatory-static-auth` when
 they need the handler. The `defaults-without-telemetry` aliases and the
 supervisor's `system-ca-roots` alias retain it.
